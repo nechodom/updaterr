@@ -468,6 +468,7 @@
   "server.unhandledRejection": "Neošetřená chyba: {error}",
   "server.uncaughtException": "Neošetřená výjimka: {error}",
   "server.stateLoadFailed": "state.json nešlo načíst ({error}), přesunuto do {path}",
+  "store.writeFailed": "state.json se nepodařilo zapsat ({error}), zkusí se to znovu s další změnou",
   "codec.older": "starší",
   "codec.want.hevc": "H.265 nebo AV1",
   "codec.want.none": "neřešit",
