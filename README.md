@@ -46,6 +46,8 @@ titles you watch.
   `CZ titulky`…) and tells a dub from subtitles.
 - **Adds a dub to the file you already have.** Keep your 4K English video and take only the German audio from
   another release. The sync is measured, the result is verified and the original is backed up.
+- **Picks the first download too.** When you add a movie or series (e.g. from Jellyseerr), Updaterr can grab the
+  best-dubbed release right away instead of Radarr/Sonarr, so you don't download the same title twice.
 - **Finds dubs that are out of sync** in files you already have and fixes them without re-encoding.
 - **Takes care of downloads.** Dead torrents are swapped for the next candidate. Imports that Radarr/Sonarr refuse
   as "not an upgrade" or "unable to parse" are forced through. After import, the language is checked against
@@ -191,16 +193,56 @@ next to replacing the whole file. The video and the other tracks stay from your 
 
 1. It downloads the "donor" release **directly into qBittorrent** (category `updaterr`, outside Radarr), and only
    the needed video from the torrent (for series, only the missing episodes). The video is downloaded
-   **sequentially**, and after the first ~48 MB its frame rate is probed. A **clearly different fps** (more than 2 %,
-   e.g. PAL 25 vs 23.976) rejects the donor right away.
+   **sequentially**. When no full-season donor exists for a series, a set of per-episode torrents is used.
 2. It checks the **real audio tracks** (ffprobe) to confirm the donor really has the language.
-3. It checks the frame rate and duration.
+3. It checks the frame rate and duration. A donor that runs at a **different speed** (PAL 25 fps vs 23.976, or a
+   gradual drift like 24 vs 23.976) is **retimed** to your file's tempo with the voice pitch restored, instead of
+   being rejected. AAC stays AAC; other codecs become E-AC-3 (max. 5.1).
 4. **Synchronization**: at 8 places in the movie it compares the audio "envelope" (music and effects are the same in
    the dub and the original) and finds the offset. A different cut or gradual drift is detected and not merged.
 5. It merges with `mkvmerge` (with the offset found, the dub as the default track) and **verifies the result again**.
 6. It backs up the original file (hardlink; no backup means no change) and imports the result through Radarr/Sonarr.
 
+- **Different cuts** (Extended, Director's Cut…) are recognized from titles and donors with the same cut are tried
+  first. When the dub only exists for another cut, a *Version for the dub* proposal downloads that cut and then adds
+  the dub to it. Never automatic.
+- **Unsuitable donors are remembered** (by hash and title), listed in the item details and can be unblocked or retried
+  from a proposal.
+- **Damaged or truncated files** (much shorter than the film) get no audio added; a whole-file *Repair* proposal is
+  offered instead, only after approval.
+- The added track is named e.g. "German (By: Updaterr)" (`mergeCredit`, can be turned off).
+
 Requires `QBIT_URL` + `QBIT_PASSWORD` and `STAGING_DIR` (or `STAGING_DIR_RADARR` / `STAGING_DIR_SONARR`).
+</details>
+
+<details>
+<summary><b>First download of new movies and series</b></summary>
+
+Settings → New movies and series → *Updaterr picks the first download* (`firstGrab`, off by default). A movie or a
+season that is newly added (e.g. requested in Jellyseerr), newly released or newly monitored is downloaded by
+Updaterr with its own rules (both languages › dub › second language, then resolution) instead of Radarr/Sonarr, so
+the same title isn't downloaded twice (Radarr's version first, the upgrade right after it).
+
+- *Movies* (`firstGrabMovies`) and *Series* (`firstGrabSeries`, whole seasons incl. multi-season packs; episodes
+  still airing are left to Sonarr), both on.
+- *Cancel their download* (`firstGrabCancelArr`, on): when Radarr/Sonarr grab a different release first (search after
+  adding, RSS), it's cancelled. The same release is left to them.
+- *Nothing suitable → Radarr/Sonarr searches* (`firstGrabFallback`, on): when nothing fits or all attempts fail,
+  their own search starts. From then on only upgrades.
+- New items are picked up every minute, or immediately with the **On Movie Added** / **On Series Add** / **On Grab**
+  webhooks. Such downloads have a *New* tag in Activity.
+- **Jellyseerr / Seerr**: if it's set to start a search in Radarr/Sonarr after a request, they download first and
+  Updaterr has to cancel it. Settings warns about it and shows how to turn it off. Needs `JELLYSEERR_CONFIG` (its
+  mounted `settings.json`) or `JELLYSEERR_URL` + `JELLYSEERR_API_KEY`.
+</details>
+
+<details>
+<summary><b>Bulk check</b></summary>
+
+Library → **Bulk check…**: listen to the tracks of all unverified items (or everything again), or search all items
+without the dub / without both languages at once. A progress bar shows how far it got and can be stopped. The
+*Show unverified* filter lists items whose language hasn't been confirmed by listening; verified ones get a
+headphones icon.
 </details>
 
 <details>
@@ -263,12 +305,12 @@ H.264 › H.265 / VP9 › AV1. The container (MKV, MP4) doesn't matter.
 <summary><b>qBittorrent: stalled torrents and cleanup after import</b></summary>
 
 **Stalled torrents.** Settings → Download and import → *qBittorrent queue* (off by default). It applies to **all
-torrents** in qBittorrent: a torrent stalled without peers for longer than `qbitStallMin` is stopped and tagged
+torrents** in qBittorrent except Updaterr's own downloads: a torrent stalled without peers for longer than `qbitStallMin` is stopped and tagged
 `updaterr-stalled` to free the queue, and retried every `qbitStallRetryMin`.
 
 **Cleanup after import.** Settings → Download and import → *Delete torrent after import* (`qbitRemoveImported`, on
 by default). Once an upgrade grabbed through Radarr/Sonarr is imported, Updaterr deletes its torrent from qBittorrent
-**including the downloaded files**; the library keeps the imported copy (hardlink or copy). Only torrents from
+**including the downloaded files** (only once the torrent is fully downloaded); the library keeps the imported copy (hardlink or copy). Only torrents from
 Updaterr's own downloads are touched (matched by hash). qBittorrent's seeding limit doesn't apply to force-started
 torrents, so they would otherwise seed forever. Turn it off if you want to seed (ratio on private trackers).
 </details>
@@ -295,7 +337,8 @@ The bot uses long polling, so it doesn't need a public address. ntfy works too (
 
 ### Instant check of new downloads
 
-In Radarr and Sonarr go to *Settings → Connect → + → Webhook* and tick **On File Import** and **On File Upgrade**:
+In Radarr and Sonarr go to *Settings → Connect → + → Webhook* and tick **On File Import** and **On File Upgrade**
+(for *First download* also **On Movie Added** / **On Series Add** and **On Grab**):
 
 - Radarr: `http://updaterr:8080/api/webhook/radarr`
 - Sonarr: `http://updaterr:8080/api/webhook/sonarr`
@@ -328,7 +371,8 @@ Settings → Languages → *Interface language*. Plural forms use `Intl.PluralRu
 - Packs without season numbers in the title ("Complete Series") and releases Sonarr can't parse aren't offered.
 - A candidate's language is estimated from the title, so a bare `MULTI` is a "guess". After download it is always
   verified from the audio tracks.
-- Merging doesn't re-encode, so a donor with a different frame rate (PAL 25 fps) is rejected.
+- Merging doesn't re-encode the video. Only an audio track that has to be retimed (different speed) is re-encoded.
+- Multi-season packs that would make some episodes worse get a warning and are never grabbed automatically.
 - If a movie's Radarr profile allows upgrades and Updaterr picks e.g. a dubbed 720p over an English 1080p, Radarr may
   later try to "upgrade" it back. Disable upgrades in the profile, or use track merging.
 

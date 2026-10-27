@@ -152,7 +152,7 @@ test('kontrola souboru v knihovně proti záloze', () => {
   assert.match(fileIssues(j, r, { lib, libProbe: { ...good, audio: [{ lang: 'en' }] }, bakProbe: bak }).join(), /chybí přidaná CZ/);
   assert.match(fileIssues(j, r, { lib, libProbe: { ...good, duration: 5900 }, bakProbe: bak }).join(), /kratší/);
   assert.match(fileIssues(j, r, { lib: { fileId: 2, size: 999 }, libProbe: good, bakProbe: bak }).join(), /změnil/);
-  assert.match(fileIssues(j, { ...r, offsetMs: 28149 }, { lib, libProbe: good, bakProbe: bak }).join(), /28\.1 s/);
+  assert.match(fileIssues(j, { ...r, offsetMs: 28149 }, { lib, libProbe: good, bakProbe: bak }).join(), /28[.,]1 s/);
   assert.match(fileIssues(j, { ...r, verifyMs: -62 }, { lib, libProbe: good, bakProbe: bak }).join(), /62 ms/);
   assert.match(fileIssues(j, r, { lib, libProbe: good, bakProbe: bak, meas: { ok: true, offsetMs: 300 } }).join(), /300 ms/);
   assert.match(fileIssues(j, r, { lib, libProbe: good, bakProbe: null }).join(), /záloha/);

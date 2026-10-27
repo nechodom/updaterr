@@ -44,13 +44,13 @@ test('JSON: gzip pro velké odpovědi, ETag a 304 pro nezměněná data', async 
 
 test('CSRF: změny z cizí stránky se odmítnou, ntfy tlačítka (bez Originu) a webhooky projdou', () => {
   const { csrfBlocked } = require('../src/http');
-  const req = (method, headers = {}) => ({ method, headers: { host: '10.96.0.2:5290', ...headers } });
+  const req = (method, headers = {}) => ({ method, headers: { host: '192.168.1.10:5290', ...headers } });
   const p = '/api/proposals/abc/grab/123';
-  assert.strictEqual(csrfBlocked(req('POST', { origin: 'http://10.96.0.2:5290', 'sec-fetch-site': 'same-origin' }), p), false, 'vlastní web');
+  assert.strictEqual(csrfBlocked(req('POST', { origin: 'http://192.168.1.10:5290', 'sec-fetch-site': 'same-origin' }), p), false, 'vlastní web');
   assert.strictEqual(csrfBlocked(req('POST'), p), false, 'ntfy tlačítko / curl bez Originu');
   assert.strictEqual(csrfBlocked(req('POST', { origin: 'https://zla.stranka.pri' }), p), true);
   assert.strictEqual(csrfBlocked(req('POST', { 'sec-fetch-site': 'cross-site' }), p), true, 'formulář z cizí stránky bez Originu');
-  assert.strictEqual(csrfBlocked(req('PUT', { origin: 'http://10.96.0.2:9999', 'sec-fetch-site': 'same-site' }), '/api/settings'), true, 'jiný port = jiný web');
+  assert.strictEqual(csrfBlocked(req('PUT', { origin: 'http://192.168.1.10:9999', 'sec-fetch-site': 'same-site' }), '/api/settings'), true, 'jiný port = jiný web');
   assert.strictEqual(csrfBlocked(req('DELETE', { origin: 'null' }), '/api/bad-donors/x'), true);
   assert.strictEqual(csrfBlocked(req('GET', { origin: 'https://zla.stranka.pri', 'sec-fetch-site': 'cross-site' }), '/api/overview'), false, 'čtení se neblokuje');
   assert.strictEqual(csrfBlocked(req('POST', { origin: 'https://radarr.example', 'sec-fetch-site': 'cross-site' }), '/api/webhook/radarr'), false);

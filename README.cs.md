@@ -44,6 +44,8 @@ seriálů je stáhne sám. Příklady níže jsou s češtinou, platí pro jaký
   `MULTi.VFF`, `PL.Lektor`…) a pozná dabing od titulků (`CZ titulky`, `VOSTFR`, `Napisy`).
 - **Přidá dabing do souboru, který už máš.** 4K video s angličtinou zůstane, z jiného releasu se vezme jen česká
   stopa. Synchronizace se změří, výsledek ověří a originál zazálohuje.
+- **Vybere i první stažení.** Když přidáš film nebo seriál (třeba z Jellyseerru), Updaterr může rovnou stáhnout
+  release s nejlepším dabingem místo Radarru/Sonarru – stejný titul se nestahuje dvakrát.
 - **Najde posunutý dabing** v souborech, které už oba jazyky mají, a opraví ho bez překódování.
 - **Pohlídá stahování.** Mrtvý torrent vymění za dalšího kandidáta. Import, který Radarr/Sonarr odmítne
   („není upgrade“, nevyparsovaný název), vynutí. Po importu ověří jazyk podle skutečných stop.
@@ -194,12 +196,12 @@ Když máš třeba film jen s EN a existuje CZ release, Updaterr nabídne kromě
 jazyk stávajícího souboru ověřený – ze značek stop (MediaInfo), nebo poslechem:
 
 1. Stáhne „donor“ release **přímo do qBittorrentu** (kategorie `updaterr`, mimo Radarr), a z torrentu jen
-   potřebné video (u seriálu jen chybějící epizody). Video se stahuje **od začátku** (sekvenčně) a po
-   prvních ~48 MB se z něj přes ffprobe zjistí snímková frekvence – **zjevně jiná fps** (rozdíl nad 2 %, např.
-   PAL 25 vs 23,976) donor odmítne hned (torrent smaže a zkusí dalšího kandidáta), ne až po stažení celého
-   torrentu. Menší rozdíly nechá na úplnou kontrolu v bodě 3 (hlavička MKV bývá zaokrouhlená na celé ms).
+   potřebné video (u seriálu jen chybějící epizody). Video se stahuje **od začátku** (sekvenčně). Když pro seriál
+   není donor s celou sérií, použije sadu torrentů po jednotlivých epizodách.
 2. Podle **skutečných zvukových stop** (ffprobe) ověří, že donor CZ opravdu obsahuje.
-3. Zkontroluje snímkovou frekvenci (25 vs 23,976 fps by se rozjíždělo) a délku.
+3. Zkontroluje snímkovou frekvenci a délku. Donor s **jinou rychlostí** (PAL 25 fps vs 23,976, nebo postupný drift
+   jako 24 vs 23,976) se neodmítne, ale zvuk se **přepočítá** na tempo stávajícího souboru a výška hlasu se vrátí.
+   AAC zůstane AAC, ostatní kodeky se převedou na E-AC-3 (max. 5.1).
 4. **Synchronizace**: na 8 místech filmu porovná „obálku“ zvuku (hudba a ruchy jsou v dabingu i originálu
    stejné) a najde posun. Pozná jiný střih i postupný drift a v tom případě nesloučí. Když přímé porovnání
    nestačí, použije EN stopu donoru jako prostředníka.
@@ -209,7 +211,47 @@ jazyk stávajícího souboru ověřený – ze značek stop (MediaInfo), nebo po
 6. Původní soubor zazálohuje (hardlink; bez zálohy se nic nemění) a výsledek naimportuje přes Radarr/Sonarr.
 
 Test na reálném filmu: uměle posunutá CZ stopa o 1,2 s byla srovnána s přesností na 1 ms a CZ stopa
-z jiného filmu byla odmítnuta. Vyžaduje `QBIT_URL` + `QBIT_PASSWORD` a `STAGING_DIR` (případně `STAGING_DIR_RADARR` / `STAGING_DIR_SONARR`).
+z jiného filmu byla odmítnuta.
+
+- **Jiné verze filmu** (Extended, Director's Cut…) se poznají z názvů a napřed se zkouší donory se stejnou verzí.
+  Když dabing existuje jen k jiné verzi, návrh *Verze k CZ dabingu* stáhne tu verzi a pak do ní dabing přidá.
+  Nikdy automaticky.
+- **Nevhodné donory se pamatují** (podle hashe a názvu), jsou vidět v detailu položky a jde je odblokovat nebo
+  zkusit znovu z návrhu.
+- **Poškozený nebo useknutý soubor** (výrazně kratší než film) dabing nedostane; nabídne se výměna celého souboru
+  (*Oprava*), vždy jen po schválení.
+- Přidaná stopa se jmenuje třeba „Čeština (By: Updaterr)“ (`mergeCredit`, jde vypnout).
+
+Vyžaduje `QBIT_URL` + `QBIT_PASSWORD` a `STAGING_DIR` (případně `STAGING_DIR_RADARR` / `STAGING_DIR_SONARR`).
+</details>
+
+<details>
+<summary><b>První stažení nových filmů a seriálů</b></summary>
+
+Nastavení → Nové filmy a seriály → *První stažení vybírá Updaterr* (`firstGrab`, výchozí vypnuto). Film nebo série,
+která je nově přidaná (třeba žádostí v Jellyseerru), nově vyšla nebo se nově sleduje, se stáhne podle pravidel
+Updaterru (oba jazyky › dabing › druhý jazyk, pak rozlišení) místo Radarru/Sonarru – stejný titul se tak nestahuje
+dvakrát (napřed verze Radarru, hned po ní upgrade).
+
+- *Filmy* (`firstGrabMovies`) a *Seriály* (`firstGrabSeries`, celé série včetně balíků více sérií; epizody, které
+  teprve vycházejí, stahuje Sonarr), obojí zapnuto.
+- *Zrušit jejich stažení* (`firstGrabCancelArr`, zapnuto): když Radarr/Sonarr stihnou stáhnout jiný release
+  (hledání po přidání, RSS), stahování se zruší. Stejný release se jim nechá.
+- *Nic vhodného → hledá Radarr/Sonarr* (`firstGrabFallback`, zapnuto): když nic nesedí nebo selžou všechny pokusy,
+  spustí se jejich hledání. Od té chvíle už jen upgrady.
+- Nové položky se kontrolují každou minutu, s webhooky **On Movie Added** / **On Series Add** / **On Grab** hned.
+  Takové stahování má v Aktivitě štítek *Nové*.
+- **Jellyseerr / Seerr**: když po žádosti sám spouští hledání v Radarru/Sonarru, stáhnou ho napřed oni a Updaterr
+  to musí rušit. Nastavení na to upozorní a ukáže, jak to vypnout. Potřebuje `JELLYSEERR_CONFIG` (připojený
+  `settings.json`) nebo `JELLYSEERR_URL` + `JELLYSEERR_API_KEY`.
+</details>
+
+<details>
+<summary><b>Hromadná kontrola</b></summary>
+
+Knihovna → **Hromadná kontrola…**: poslechnout stopy všech neověřených položek (nebo všech znovu), nebo najednou
+prohledat položky bez dabingu / bez obou jazyků. Ukazatel průběhu jde zastavit. Filtr *Zobrazit neověřené* ukáže
+položky, jejichž jazyk ještě nepotvrdil poslech; ověřené mají ikonu sluchátek.
 </details>
 
 <details>
@@ -298,14 +340,14 @@ rozlišením** v hledaném kodeku – nabídne se jako *Novější formát*. Kod
 <summary><b>qBittorrent: zaseknuté torrenty a úklid po importu</b></summary>
 
 **Zaseknuté torrenty.** Nastavení → Stahování a import → *Fronta qBittorrentu* (výchozí vypnuto). Platí **pro
-všechny torrenty v qBittorrentu**, i ty z Radarru/Sonarru. Torrent, který stojí bez spojení (`stalledDL`, magnet bez
+všechny torrenty v qBittorrentu** kromě stahování Updaterru, i ty z Radarru/Sonarru. Torrent, který stojí bez spojení (`stalledDL`, magnet bez
 metadat) déle než `qbitStallMin` (30 min), se zastaví a dostane štítek `updaterr-stalled`, aby uvolnil místo ve
 frontě dalším. Každých `qbitStallRetryMin` (120 min) se zastavené znovu spustí: když se rozjedou, štítek zmizí.
 Vynucené (force start) a ručně zastavené torrenty se nechávají být.
 
 **Úklid po importu.** Nastavení → Stahování a import → *Po importu smazat torrent* (`qbitRemoveImported`, výchozí
 zapnuto). Jakmile je upgrade stažený přes Radarr/Sonarr naimportovaný, Updaterr jeho torrent smaže z qBittorrentu
-**i se staženými soubory** – v knihovně zůstává importovaná kopie (hardlink nebo kopie). Týká se jen torrentů ze
+**i se staženými soubory** (až když je torrent celý stažený) – v knihovně zůstává importovaná kopie (hardlink nebo kopie). Týká se jen torrentů ze
 stahování Updaterru (párují se podle hashe). Limit seedování v qBittorrentu neplatí pro vynucené torrenty (Force
 start), ty by jinak seedovaly navždy. Kdo chce seedovat (sdílecí poměr na privátních trackerech), nastavení vypne.
 </details>
@@ -337,7 +379,8 @@ Do `.env` doplň `QBIT_URL=…` a `QBIT_PASSWORD=…` (případně `QBIT_USERNAM
 
 ### Okamžitá kontrola nově stažených
 
-Radarr i Sonarr → *Settings → Connect → + → Webhook*, zaškrtnout **On File Import** a **On File Upgrade**:
+Radarr i Sonarr → *Settings → Connect → + → Webhook*, zaškrtnout **On File Import** a **On File Upgrade**
+(pro *První stažení* i **On Movie Added** / **On Series Add** a **On Grab**):
 
 - Radarr: `http://updaterr:8080/api/webhook/radarr`
 - Sonarr: `http://updaterr:8080/api/webhook/sonarr`
@@ -367,7 +410,8 @@ a přeložit; pak se objeví v Nastavení → Jazyky → *Jazyk rozhraní*.
 - Balíky bez čísel sérií v názvu („Complete Series“) a releasy, které Sonarr nevyparsuje, se nenabízejí.
 - Jazyk kandidáta se odhaduje z názvu – `MULTI` bez dalšího je „odhad“, `.CZ-FTU` se bere jen jako CZ
   (i když často obsahuje i EN). Po stažení se to vždy ověří ze zvukových stop.
-- Slučování nepřekódovává – donor s jinou snímkovou frekvencí (PAL 25 fps) se odmítne.
+- Slučování nepřekódovává obraz. Překóduje se jen zvuková stopa, kterou je potřeba přepočítat (jiná rychlost).
+- Balík více sérií, který by některé epizody zhoršil, dostane varování a nikdy se nestáhne automaticky.
 - Pokud má film v Radarru profil s upgrady a Updaterr do něj dá třeba CZ 720p místo EN 1080p, Radarr se ho
   může později pokusit „upgradovat“ zpátky. Pomůže vypnout upgrady v profilu, nebo použít slučování stop.
 
