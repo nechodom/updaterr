@@ -123,7 +123,15 @@ class Backups {
   }
 
   get st() { return this.ctx.store.settings; }
-  get root() { return this.st.stagingDir ? path.join(this.st.stagingDir, 'backup') : null; }
+  // Kořeny záloh: samostatné staging pro filmy/seriály (podle aplikace úlohy) nebo společný stagingDir
+  get roots() {
+    const st = this.st;
+    return [...new Set([st.stagingDirRadarr, st.stagingDirSonarr, st.stagingDir].filter(Boolean))]
+      .map((d) => path.join(d, 'backup'));
+  }
+
+  // Pro zobrazení v UI (jednotlivé kořeny oddělené „ · “)
+  get root() { return this.roots.join(' · ') || null; }
 
   job(id) {
     const s = this.ctx.store.s;
@@ -132,30 +140,34 @@ class Backups {
 
   // Zálohy na disku spárované s úlohami
   list() {
-    let dirs = [];
-    if (!this.root) return [];
-    try { dirs = fs.readdirSync(this.root, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name); } catch { /* složka ještě není */ }
     const out = [];
-    for (const id of dirs) {
-      const dir = path.join(this.root, id);
-      let files;
-      try { files = walk(dir); } catch { continue; }
-      const j = this.job(id);
-      const keep = !j ? 'orphan' : j.backupKeep === 'forever' ? 'forever' : j.backupCustom ? 'custom' : 'auto';
-      out.push({
-        id, dir, keep,
-        type: j?.type || null, app: j?.app || null, itemKey: j?.itemKey || null,
-        label: j?.label || id, title: j?.title || null,
-        state: j?.state || null, active: Boolean(j?.active),
-        finishedAt: j?.finishedAt || null,
-        check: mergeStatus(j),
-        added: addedAudio(j),
-        createdAt: j?.importAt || j?.finishedAt || Math.min(...files.map((f) => f.mtime), fs.statSync(dir).mtimeMs),
-        expiresAt: keep === 'forever' || keep === 'orphan' ? null : j.backupUntil || null,
-        files: files.map(({ mtime, ...f }) => f).sort((a, b) => a.name.localeCompare(b.name)),
-        size: files.reduce((s, f) => s + f.size, 0),
-        exclusive: files.reduce((s, f) => s + (f.shared ? 0 : f.size), 0),
-      });
+    const seen = new Set();
+    for (const root of this.roots) {
+      let dirs = [];
+      try { dirs = fs.readdirSync(root, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name); } catch { /* složka ještě není */ }
+      for (const id of dirs) {
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const dir = path.join(root, id);
+        let files;
+        try { files = walk(dir); } catch { continue; }
+        const j = this.job(id);
+        const keep = !j ? 'orphan' : j.backupKeep === 'forever' ? 'forever' : j.backupCustom ? 'custom' : 'auto';
+        out.push({
+          id, dir, keep,
+          type: j?.type || null, app: j?.app || null, itemKey: j?.itemKey || null,
+          label: j?.label || id, title: j?.title || null,
+          state: j?.state || null, active: Boolean(j?.active),
+          finishedAt: j?.finishedAt || null,
+          check: mergeStatus(j),
+          added: addedAudio(j),
+          createdAt: j?.importAt || j?.finishedAt || Math.min(...files.map((f) => f.mtime), fs.statSync(dir).mtimeMs),
+          expiresAt: keep === 'forever' || keep === 'orphan' ? null : j.backupUntil || null,
+          files: files.map(({ mtime, ...f }) => f).sort((a, b) => a.name.localeCompare(b.name)),
+          size: files.reduce((s, f) => s + f.size, 0),
+          exclusive: files.reduce((s, f) => s + (f.shared ? 0 : f.size), 0),
+        });
+      }
     }
     return out.sort((a, b) => b.createdAt - a.createdAt);
   }
@@ -164,7 +176,8 @@ class Backups {
     const list = this.list();
     let disk = null;
     try {
-      const f = fs.statfsSync(this.root && fs.existsSync(this.root) ? this.root : this.st.stagingDir);
+      const dir = this.roots.find((d) => fs.existsSync(d)) || this.roots[0];
+      const f = fs.statfsSync(dir);
       disk = { free: f.bavail * f.bsize, total: f.blocks * f.bsize };
     } catch { /* bez disku */ }
     return {
@@ -282,7 +295,7 @@ class Backups {
     const b = this.list().find((x) => x.id === id);
     if (!b) throw Object.assign(new Error(I18N.t('backup.err.notFound')), { status: 404 });
     if (b.active) throw new Error(I18N.t('backup.err.active'));
-    if (path.dirname(b.dir) !== this.root) throw new Error(I18N.t('backup.err.badPath'));
+    if (!this.roots.includes(path.dirname(b.dir))) throw new Error(I18N.t('backup.err.badPath'));
     fs.rmSync(b.dir, { recursive: true, force: true });
     const j = this.job(id);
     if (j) j.backupRemoved = true;
