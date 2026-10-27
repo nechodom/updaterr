@@ -12,7 +12,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const L = require('./lang');
 const A = require('./audio');
-const { newId, stagingFor, anyStaging } = require('./store');
+const { newId } = require('./store');
 const { refreshItem } = require('./library');
 const { backupOriginal, isTransient } = require('./merge');
 const { itemLabel } = require('./search');
@@ -277,7 +277,7 @@ class DubSync {
     const sum = this.summary(item);
     if (!sum?.warn) throw new Error(I18N.t('err.syncNothingToFix'));
     const st = this.st;
-    if (!anyStaging(st)) throw new Error(I18N.t('err.noStagingDir'));
+    if (!st.stagingDir) throw new Error(I18N.t('err.noStagingDir'));
     const id = newId();
     const j = {
       id, type: 'syncfix',
@@ -286,7 +286,7 @@ class DubSync {
       fileIds: sum.badFiles.map((f) => f.fileId),
       expectedMs: sum.offsetMs,
       prev: { tier: item.current.tier, audio: item.current.audio, quality: item.current.quality },
-      dir: path.join(stagingFor(st, item.app), `sync-${id}`),
+      dir: path.join(st.stagingDir, `sync-${id}`),
       grabbedAt: Date.now(), state: 'queued', active: true, progress: 0,
     };
     store.s.syncFixes[id] = j;
@@ -406,7 +406,7 @@ class DubSync {
     }
 
     // Záloha originálů jako u slučování; bez zálohy se neimportuje
-    j.backupDir = path.join(stagingFor(st, j.app), 'backup', j.id);
+    j.backupDir = path.join(st.stagingDir, 'backup', j.id);
     for (const r of ok) {
       try {
         if (backupOriginal(r.path, j.backupDir) === 'kopie') r.backup = 'kopie';

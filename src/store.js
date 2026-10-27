@@ -56,10 +56,6 @@ const DEFAULT_SETTINGS = {
   backupDeleteVerified: false, // zálohu smazat hned po ověřeném sloučení / opravě; při odchylce zůstane a přijde notifikace
   // Složka pro donory a zálohy – musí ji vidět qBittorrent i Radarr/Sonarr pod stejnou cestou
   stagingDir: env.STAGING_DIR || '',
-  // Volitelně samostatný staging pro filmy (radarr) a seriály (sonarr): každý na stejném
-  // filesystému jako svá média, aby zálohy šly hardlinkem a import byl okamžitý rename
-  stagingDirRadarr: env.STAGING_DIR_RADARR || '',
-  stagingDirSonarr: env.STAGING_DIR_SONARR || '',
   qbitCategory: 'updaterr',
   // Hlídané položky (nastavují se u filmu/seriálu): kontrola častěji + automatický upgrade
   watchIntervalDays: 2,
@@ -208,15 +204,4 @@ function migrate(st) {
 
 const newId = () => crypto.randomBytes(5).toString('hex');
 
-// Staging pro danou aplikaci ('radarr' | 'sonarr'): vlastní adresář, jinak společný stagingDir
-function stagingFor(settings, app) {
-  const own = app === 'sonarr' ? settings.stagingDirSonarr : app === 'radarr' ? settings.stagingDirRadarr : '';
-  return own || settings.stagingDir;
-}
-
-// Je nastavený nějaký staging (společný nebo pro některou aplikaci)?
-function anyStaging(settings) {
-  return Boolean(settings.stagingDir || settings.stagingDirRadarr || settings.stagingDirSonarr);
-}
-
-module.exports = { Store, DEFAULT_SETTINGS, newId, migrate, stagingFor, anyStaging };
+module.exports = { Store, DEFAULT_SETTINGS, newId, migrate };
