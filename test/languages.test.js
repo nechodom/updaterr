@@ -32,6 +32,29 @@ test('němčina + angličtina', () => {
   }
 });
 
+test('dvojice krátkých kódů (DE/EN, ES-EN) – jen v seznamu jazyků, ne jako běžné slovo', () => {
+  const cases = [
+    ['de', 'Dune (2021)(DE/EN)[1080p]', 3],
+    ['de', 'Dune.2021.DUAL.DE-EN.1080p.WEB', 3],
+    ['de', 'De-Lovely.2004.1080p.BluRay', 1],
+    ['de', 'Dune.2021.1080p.WEB-DL.DTS-HD', 1],
+    ['es', 'Dune (2021)(ES/EN)[1080p]', 3],
+    ['es', 'La.Casa.de.Papel.S01.1080p.WEB', 1],
+    ['it', 'Dune (2021)(IT+EN)[1080p]', 3],
+    ['it', 'It.2017.1080p.BluRay', 1],
+    ['fr', 'Dune.2021.FR-EN.1080p', 3],
+    ['pl', 'Dune (2021)(PL/EN)[1080p]', 3],
+  ];
+  try {
+    for (const [lang, title, exp] of cases) {
+      L.configure({ primary: lang, secondary: 'en' });
+      assert.strictEqual(tier(title), exp, `${lang}: ${title}`);
+    }
+  } finally {
+    L.configure({ primary: 'cs', secondary: 'en' });
+  }
+});
+
 test('francouzština – VOSTFR jsou titulky', () => {
   L.configure({ primary: 'fr', secondary: 'en' });
   try {

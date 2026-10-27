@@ -1,6 +1,6 @@
 {
   "name": "updaterr",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Finds better-dubbed versions of your Radarr/Sonarr library (any dub language + original, then quality) and offers them for download",
   "main": "src/server.js",
   "private": true,

@@ -55,9 +55,20 @@ function audioFromMediaInfo(audioLanguages) {
   return { pri: Boolean(PRI) && langs.includes(PRI), sec: Boolean(SEC) && langs.includes(SEC), langs, known: langs.length > 0, raw: audioLanguages || '' };
 }
 
+// "(DE/EN)", "ES-EN", "DE+EN": krátké kódy, které samy nebereme (de, es, it… jsou běžná slova), platí
+// v seznamu jazyků spojeném / - +, když je v něm aspoň jeden jednoznačný jazyk. Nahradí se jednoznačným slovem.
+const PAIR_RE = /(?<![\p{L}\p{N}])[a-z]{2,3}(?:[\/+-][a-z]{2,3})+(?![\p{L}\p{N}])/gu;
+const strongToken = (code) => LANGS.get(code)?.tokens.find((w) => langOf(w) === code) || null;
+function expandPairs(s) {
+  return s.replace(PAIR_RE, (m) => {
+    const parts = m.split(/[\/+-]/);
+    if (!parts.some((p) => langOf(p)) || !parts.every((p) => langOf(p) || strongToken(p))) return m;
+    return parts.map((p) => (langOf(p) ? p : strongToken(p))).join(' ');
+  });
+}
+
 function tokenize(title) {
-  const raw = String(title || '')
-    .toLowerCase()
+  const raw = expandPairs(String(title || '').toLowerCase())
     // "CZtitulky", "CZdab", "ENsub" → rozdělit
     .replace(GLUED_RE, '$1 $2')
     .split(/[^\p{L}\p{N}]+/u)
