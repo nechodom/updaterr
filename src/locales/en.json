@@ -32,7 +32,7 @@
   "err.itemNotFound": "The item does not exist",
   "err.itemBusyAny": "A download, merge or fix is already running for this item",
   "err.syncNothingToFix": "According to the last measurement the dub is in sync – nothing to fix",
-  "err.noStagingDir": "No working folder is set (STAGING_DIR / Settings → Track merging)",
+  "err.noStagingDir": "No working folder is set (STAGING_DIR, or STAGING_DIR_RADARR / STAGING_DIR_SONARR)",
   "err.syncFixBusy": "The fix is already running – it cannot be cancelled now, wait a few minutes",
   "err.mergeNeedsQbit": "Merging needs access to qBittorrent (QBIT_PASSWORD in .env)",
   "err.notRunning": "Not running",

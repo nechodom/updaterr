@@ -331,6 +331,20 @@ test('oprava – po přesném změření sedí → nic se nemění', async () =>
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('oprava – bez stagingu pro aplikaci položky se nezaloží (relativní složka)', () => {
+  const { dir, ctx, item } = setup();
+  Object.assign(ctx.store.settings, { stagingDir: '', stagingDirSonarr: path.join(dir, 'tv-staging') });
+  item.syncCheck = { files: { 899: { at: new Date().toISOString(), ok: true, offsetMs: -337, matched: '5/6' } } };
+  const sync = new DubSync(ctx);
+  assert.throws(() => sync.start(item.key), /pracovní složka/);
+  assert.deepStrictEqual(Object.keys(ctx.store.s.syncFixes), []);
+  ctx.store.settings.stagingDirRadarr = path.join(dir, 'movie-staging');
+  const j = sync.start(item.key);
+  assert.strictEqual(path.dirname(j.dir), path.join(dir, 'movie-staging'));
+  delete ctx.store.s.syncFixes[j.id]; // úlohu nespouštět
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('hromadná oprava – založí jen posunuté a volné položky, ostatní přeskočí', async () => {
   const { dir, ctx, item } = setup();
   const now = new Date().toISOString();

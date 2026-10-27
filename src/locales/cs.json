@@ -32,7 +32,7 @@
   "err.itemNotFound": "Položka neexistuje",
   "err.itemBusyAny": "Pro tuhle položku právě běží stahování, slučování nebo oprava",
   "err.syncNothingToFix": "Podle posledního měření dabing sedí – není co opravovat",
-  "err.noStagingDir": "Není nastavená pracovní složka (STAGING_DIR / Nastavení → Slučování stop)",
+  "err.noStagingDir": "Není nastavená pracovní složka (STAGING_DIR, případně STAGING_DIR_RADARR / STAGING_DIR_SONARR)",
   "err.syncFixBusy": "Oprava už běží – zrušit ji teď nejde, počkej pár minut",
   "err.mergeNeedsQbit": "Slučování potřebuje přístup ke qBittorrentu (QBIT_PASSWORD v .env)",
   "err.notRunning": "Neběží",

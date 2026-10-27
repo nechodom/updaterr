@@ -6,7 +6,7 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { mergeCandidates, neededLang, parseEpisode, speechLangs, Merger } = require('../src/merge');
 const { watchOf, setWatch, autoWatchNew, recheckMs, autoAllowed } = require('../src/watch');
-const { DEFAULT_SETTINGS } = require('../src/store');
+const { DEFAULT_SETTINGS, stagingFor } = require('../src/store');
 
 const helpers = {
   HARD_REJECT: /unknown (movie|series)/i,
@@ -74,6 +74,30 @@ test('mergeCandidates – bez qBittorrentu nebo bez ověřeného jazyka nic', ()
   const r = [{ guid: 'a', title: 'Film (2020)(CZ)[720p]', seeders: 50, protocol: 'torrent', size: 1e9, quality: {}, rejections: [] }];
   assert.strictEqual(mergeCandidates(item, r, { store: mkStore(), qbit: { enabled: false } }, helpers).length, 0);
   assert.strictEqual(mergeCandidates({ ...item, current: { ...item.current, audioSource: 'nazev' } }, r, { store: mkStore(), qbit: { enabled: true } }, helpers).length, 0);
+});
+
+test('stagingFor – vlastní složka aplikace, jinak společná', () => {
+  const st = { stagingDir: '/shared', stagingDirRadarr: '/movies/staging', stagingDirSonarr: '' };
+  assert.strictEqual(stagingFor(st, 'radarr'), '/movies/staging');
+  assert.strictEqual(stagingFor(st, 'sonarr'), '/shared');
+  assert.strictEqual(stagingFor({ ...st, stagingDir: '' }, 'sonarr'), '');
+});
+
+test('mergeCandidates – staging jen pro druhou aplikaci nestačí', () => {
+  const item = { app: 'sonarr', season: 1, origLang: 'en', current: { tier: 1, audioSource: 'mediainfo', files: 10 } };
+  const r = [{ guid: 'a', title: 'Serial S01 (CZ)[720p]', seeders: 50, protocol: 'torrent', size: 1e9, fullSeason: true, seasonNumber: 1, quality: {}, rejections: [] }];
+  const only = (extra) => mergeCandidates(item, r, { store: mkStore({ stagingDir: '', ...extra }), qbit: { enabled: true } }, helpers);
+  assert.strictEqual(only({ stagingDirRadarr: '/movies/staging' }).length, 0);
+  assert.strictEqual(only({ stagingDirSonarr: '/tv/staging' }).length, 1);
+});
+
+test('Merger.start – bez stagingu pro aplikaci položky odmítne (návrh starší než změna nastavení)', async () => {
+  const store = mkStore({ stagingDir: '', stagingDirRadarr: '/movies/staging' });
+  store.s.items['sonarr:7:1'] = { key: 'sonarr:7:1', app: 'sonarr', arrId: 7, season: 1, current: {} };
+  store.s.proposals = { p1: { status: 'pending', itemKey: 'sonarr:7:1', candidates: [{ kind: 'merge' }] } };
+  store.s.merges = {};
+  const m = new Merger({ store, qbit: { enabled: true }, downloads: { active: () => [] } });
+  await assert.rejects(() => m.start('p1', 0), /pracovní složka/);
 });
 
 test('mergeCandidates – jazyk ověřený poslechem stačí', () => {

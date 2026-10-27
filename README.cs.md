@@ -98,7 +98,9 @@ v `.env`: `PRIMARY_LANGUAGE=cs`, `SECOND_LANGUAGE=en`). Dokud není vybraný, kn
 
 **Cesty:** knihovna musí být v kontejneru pod **stejnou cestou** jako v Radarru, Sonarru a qBittorrentu
 (`MEDIA_HOST_DIR` na hostiteli → `MEDIA_DIR` v kontejneru). Pracovní složka `STAGING_DIR` (donory a zálohy) má být
-uvnitř, ať jsou zálohy hardlinky na stejném disku.
+uvnitř, ať jsou zálohy hardlinky na stejném disku. Když jsou filmy a seriály na různých filesystémech, nastav i
+`STAGING_DIR_RADARR` a `STAGING_DIR_SONARR`: každá aplikace pak má vlastní pracovní složku na disku své knihovny
+a `STAGING_DIR` slouží jen jako záloha.
 
 ### Náhled jen pro čtení na jiném portu
 
@@ -207,7 +209,7 @@ jazyk stávajícího souboru ověřený – ze značek stop (MediaInfo), nebo po
 6. Původní soubor zazálohuje (hardlink; bez zálohy se nic nemění) a výsledek naimportuje přes Radarr/Sonarr.
 
 Test na reálném filmu: uměle posunutá CZ stopa o 1,2 s byla srovnána s přesností na 1 ms a CZ stopa
-z jiného filmu byla odmítnuta. Vyžaduje `QBIT_URL` + `QBIT_PASSWORD` a `STAGING_DIR`.
+z jiného filmu byla odmítnuta. Vyžaduje `QBIT_URL` + `QBIT_PASSWORD` a `STAGING_DIR` (případně `STAGING_DIR_RADARR` / `STAGING_DIR_SONARR`).
 </details>
 
 <details>

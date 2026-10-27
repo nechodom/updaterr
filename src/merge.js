@@ -7,7 +7,7 @@ const path = require('node:path');
 const L = require('./lang');
 const S = require('./speech');
 const A = require('./audio');
-const { newId, stagingFor, anyStaging } = require('./store');
+const { newId, stagingFor } = require('./store');
 const { refreshItem } = require('./library');
 const I18N = require('./i18n');
 
@@ -113,7 +113,7 @@ function parseEpisode(name) {
  */
 function mergeCandidates(item, releases, ctx, h) {
   const st = ctx.store.settings;
-  if (!st.mergeEnabled || !ctx.qbit?.enabled || !anyStaging(st)) return [];
+  if (!st.mergeEnabled || !ctx.qbit?.enabled || !stagingFor(st, item.app)) return [];
   if (!L.audioVerified(item.current)) return []; // stávající jazyk musí být ověřený ze stop nebo poslechem
   const need = neededLang(item, require('./watch').wantOf(ctx.store, item));
   if (!need) return [];
@@ -208,6 +208,9 @@ class Merger {
     if (p.status !== 'pending') throw new Error(I18N.t('err.proposalDone', { status: p.status }));
     const item = store.s.items[p.itemKey];
     if (!item) throw new Error(I18N.t('err.itemGone'));
+    // Návrh mohl vzniknout před změnou nastavení – staging musí existovat pro aplikaci položky
+    const staging = stagingFor(st, item.app);
+    if (!staging) throw new Error(I18N.t('err.noStagingDir'));
     const busy = new Set([...this.ctx.downloads.active().flatMap((d) => d.itemKeys || [d.itemKey]), ...this.active().map((j) => j.itemKey)]);
     if (busy.has(item.key)) throw new Error(I18N.t('err.itemBusy'));
     let cand = p.candidates?.[idx];
@@ -231,10 +234,10 @@ class Merger {
       ? (await this.targets({ itemKey: item.key, app: item.app, arrId: item.arrId, season: item.season, need: cand.mergeLang })).flatMap((t) => t.episodeNumbers)
       : null;
     const id = newId();
-    const dir = path.join(stagingFor(st, item.app), id);
+    const dir = path.join(staging, id);
     fs.mkdirSync(path.join(dir, 'donor'), { recursive: true });
     try {
-      await this.qbit.ensureCategory(st.qbitCategory, stagingFor(st, item.app));
+      await this.qbit.ensureCategory(st.qbitCategory, staging);
       await this.qbit.add({
         downloadUrl: cand.downloadUrl, magnetUrl: cand.magnetUrl,
         savepath: path.join(dir, 'donor'), category: st.qbitCategory, tags: `updaterr,ujob-${id}`,
@@ -489,7 +492,7 @@ class Merger {
 
     // Místo na disku: výsledek je zhruba velikost stávajícího souboru + zvuková stopa
     const need = targets.reduce((s, t) => s + (fs.existsSync(t.path) ? fs.statSync(t.path).size : 0), 0) * 1.1;
-    const sfs = fs.statfsSync(stagingFor(st, j.app));
+    const sfs = fs.statfsSync(path.dirname(j.dir)); // staging úlohy (j.dir = <staging>/<id>)
     if (sfs.bavail * sfs.bsize < need) return this.fail(j, I18N.t('common.lowDisk', { gb: (need / 1024 ** 3).toFixed(1) }));
 
     const results = [];
@@ -526,7 +529,7 @@ class Merger {
     }
 
     // Záloha původních souborů (hardlink = nezabírá místo navíc; jinak kopie). Bez zálohy se neimportuje.
-    j.backupDir = path.join(stagingFor(st, j.app), 'backup', j.id);
+    j.backupDir = path.join(path.dirname(j.dir), 'backup', j.id);
     for (const r of ok) {
       try {
         if (backupOriginal(r.path, j.backupDir) === 'kopie') r.backup = 'kopie';

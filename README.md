@@ -101,7 +101,9 @@ Open `http://<server>:5290` (`UPDATERR_PORT`) and choose your dub language in **
 
 **Paths:** mount the media library under the **same path** Radarr, Sonarr and qBittorrent use
 (`MEDIA_HOST_DIR` on the host → `MEDIA_DIR` in the container). Keep `STAGING_DIR` (donor downloads and backups)
-inside it, so backups are hardlinks on the same disk.
+inside it, so backups are hardlinks on the same disk. If movies and series live on different filesystems, set
+`STAGING_DIR_RADARR` and `STAGING_DIR_SONARR` as well: each app then uses its own staging folder on its library's disk,
+and `STAGING_DIR` is only the fallback.
 
 ### Read-only preview on another port
 
@@ -198,7 +200,7 @@ next to replacing the whole file. The video and the other tracks stay from your 
 5. It merges with `mkvmerge` (with the offset found, the dub as the default track) and **verifies the result again**.
 6. It backs up the original file (hardlink; no backup means no change) and imports the result through Radarr/Sonarr.
 
-Requires `QBIT_URL` + `QBIT_PASSWORD` and `STAGING_DIR`.
+Requires `QBIT_URL` + `QBIT_PASSWORD` and `STAGING_DIR` (or `STAGING_DIR_RADARR` / `STAGING_DIR_SONARR`).
 </details>
 
 <details>

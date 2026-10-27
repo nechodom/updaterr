@@ -214,9 +214,4 @@ function stagingFor(settings, app) {
   return own || settings.stagingDir;
 }
 
-// Je nastavený nějaký staging (společný nebo pro některou aplikaci)?
-function anyStaging(settings) {
-  return Boolean(settings.stagingDir || settings.stagingDirRadarr || settings.stagingDirSonarr);
-}
-
-module.exports = { Store, DEFAULT_SETTINGS, newId, migrate, stagingFor, anyStaging };
+module.exports = { Store, DEFAULT_SETTINGS, newId, migrate, stagingFor };
