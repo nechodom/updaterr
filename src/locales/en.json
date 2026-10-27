@@ -449,6 +449,7 @@
   "server.unhandledRejection": "Unhandled error: {error}",
   "server.uncaughtException": "Uncaught exception: {error}",
   "server.stateLoadFailed": "state.json could not be loaded ({error}), moved to {path}",
+  "store.writeFailed": "state.json could not be written ({error}), will retry on the next change",
   "codec.older": "older",
   "codec.want.hevc": "H.265 or AV1",
   "codec.want.none": "don't care",

@@ -115,9 +115,32 @@ class Store {
 
   save() {
     if (this.timer) return;
-    this.timer = setTimeout(() => this.flush(), 2000);
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.write().catch((e) => console.error(t('store.writeFailed', { error: e.message })));
+    }, 2000);
   }
 
+  // Asynchronní zápis: event loop nesmí nikdy čekat na disk. Média leží na sdíleném HDD poolu,
+  // kde extrakce zvuku (ffmpeg/whisper) umí I/O na dlouhé minuty zamrazit – zamrzlý writeFileSync
+  // tehdy zablokoval celý server včetně /api/health a liveness probe kontejner zabila. Zápis běží
+  // souběžně s obsluhou požadavků; změna stavu uprostřed zápisu se zapíše hned znovu (dirty).
+  async write() {
+    if (this.writing) { this.dirty = true; return; }
+    this.writing = true;
+    try {
+      do {
+        this.dirty = false;
+        const tmp = this.file + '.tmp';
+        await fs.promises.writeFile(tmp, JSON.stringify(this.state));
+        await fs.promises.rename(tmp, this.file);
+      } while (this.dirty);
+    } finally {
+      this.writing = false;
+    }
+  }
+
+  // Synchronní zápis jen při ukončení procesu (SIGINT/SIGTERM) – tehdy nevadí na disk čekat
   flush() {
     clearTimeout(this.timer);
     this.timer = null;
