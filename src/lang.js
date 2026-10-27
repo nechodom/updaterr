@@ -64,7 +64,9 @@ function expandPairs(s) {
     const parts = m.split(/[\/+-]/);
     if (!parts.some((p) => langOf(p)) || !parts.every((p) => langOf(p) || strongToken(p))) return m;
     return parts.map((p) => (langOf(p) ? p : strongToken(p))).join(' ');
-  });
+  })
+    // Samotný kód v závorkách – "(DE)", "[ES]", "(IT dabing)": v závorce je to označení jazyka, ne slovo
+    .replace(/([([])\s*([a-z]{2,3})(?=\s*[)\]]|\s+\p{L})/gu, (m, br, code) => (!langOf(code) && strongToken(code) ? `${br}${strongToken(code)}` : m));
 }
 
 // Hranice skupin: závorky, "+" a " - " oddělují části názvu – "(CZ/EN)(CZ titulky)" jsou dvě různé informace

@@ -104,3 +104,16 @@ test('migrace stavu z verze jen pro CZ + EN', () => {
   migrate(fresh);
   assert.deepStrictEqual(fresh, { settings: { language: 'de' } });
 });
+
+test('a bare language code in brackets counts as audio: (DE), [ES], (IT)', () => {
+  try {
+    L.configure({ primary: 'de', secondary: 'en' });
+    assert.strictEqual(L.tierOf(L.evaluateRelease('Dune (2024)(DE)(EN titulky)')), 2);
+    assert.strictEqual(L.tierOf(L.evaluateRelease('Dune [DE] 1080p')), 2);
+    L.configure({ primary: 'it', secondary: 'en' });
+    assert.strictEqual(L.tierOf(L.evaluateRelease('Dune (IT) 1080p')), 2);
+    assert.strictEqual(L.tierOf(L.evaluateRelease('It (2017) (EN) 1080p')), 1);
+  } finally {
+    L.configure({ primary: 'cs', secondary: 'en' });
+  }
+});
