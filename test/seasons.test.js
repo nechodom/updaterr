@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 require('../src/i18n').setLocale('cs'); // testy ověřují české texty
 const S = require('../src/seasons');
-const { evaluateReleases, evaluateEpisodeSet, rejectProposal } = require('../src/search');
+const { evaluateReleases, evaluateEpisodeSet, rejectProposal, expireStaleProposals } = require('../src/search');
 const { Downloads } = require('../src/downloads');
 const { DEFAULT_SETTINGS } = require('../src/store');
 
@@ -236,6 +236,48 @@ test('sada epizod – jen hledané jazyky', () => {
   assert.strictEqual(set.notes[0], 'epizody E01 · E02 už CZ má');
 });
 
+test('sada epizod ve vycházející sérii: poznámka, kolik epizod v knihovně je', () => {
+  const ctx = mkCtx();
+  const item = { ...season(4, 1), episodeCount: 10 };
+  const files = { 1: { id: 1, mediaInfo: { audioLanguages: 'eng' }, quality: { quality: { name: 'WEBDL-1080p', resolution: 1080, source: 'web' } } } };
+  const episodes = [
+    { id: 9760, seasonNumber: 4, episodeNumber: 1, hasFile: true, episodeFileId: 1 },
+    { id: 9761, seasonNumber: 4, episodeNumber: 2, hasFile: false, episodeFileId: 0 },
+  ];
+  const r = rel('e1', 'Tulsa King S04E01 (CZ/EN)[1080p][WEB-DL][HEVC]', {
+    fullSeason: false, size: 1.5e9, rejections: [], seasonNumber: 4, mappedSeasonNumber: 4, mappedEpisodeInfo: [{ id: 9760, seasonNumber: 4, episodeNumber: 1 }],
+  });
+  const set = evaluateEpisodeSet(item, [r], ctx, { episodes, files });
+  assert.deepStrictEqual(set.notes, ['epizody E01', 'v knihovně 1 z 10 epizod série – ostatní sada neřeší']);
+});
+
+test('změna souborů v knihovně zneplatní čekající návrh a spustí nové hledání', () => {
+  const ctx = mkCtx();
+  const queued = [];
+  Object.assign(ctx, { searcher: { enqueue: (k) => queued.push(k) }, busyKeys: () => new Set() });
+  ctx.store.log = () => {};
+  const s4 = season(4, 1);
+  const s5 = season(5, 1);
+  ctx.store.s.items = { [s4.key]: s4, [s5.key]: s5 };
+  const pend = (id, extra) => ({ id, status: 'pending', label: id, candidates: [], ...extra });
+  ctx.store.s.proposals = {
+    same: pend('same', { itemKey: s5.key, current: { ...s5.current } }),
+    set: pend('set', { itemKey: s4.key, current: { ...s4.current, fileIds: [401] } }),
+    first: pend('first', { first: true, itemKey: s4.key, current: { fileIds: [] } }),
+  };
+  assert.strictEqual(expireStaleProposals(ctx), 1);
+  assert.strictEqual(ctx.store.s.proposals.set.status, 'expired', 'přibyla epizoda 402');
+  assert.strictEqual(ctx.store.s.proposals.same.status, 'pending');
+  assert.strictEqual(ctx.store.s.proposals.first.status, 'pending', 'první stažení řeší firstgrab');
+  assert.deepStrictEqual(queued, [s4.key]);
+
+  // balík více sérií: změna v kterékoli z nich
+  ctx.store.s.proposals = { multi: pend('multi', { groupKey: 'sonarr:10:multi', itemKey: s4.key, itemKeys: [s4.key, s5.key], current: { fileIds: [...s4.current.fileIds, ...s5.current.fileIds] } }) };
+  assert.strictEqual(expireStaleProposals(ctx), 0);
+  s5.current = { ...s5.current, fileIds: [501, 503] };
+  assert.strictEqual(expireStaleProposals(ctx), 1);
+});
+
 test('vynucený import filmu s nerozparsovatelným názvem – kvalita a jazyky z release', async () => {
   const calls = [];
   const quality = { quality: { id: 9, name: 'HDTV-1080p' }, revision: { version: 1 } };
@@ -263,4 +305,32 @@ test('vynucený import filmu s nerozparsovatelným názvem – kvalita a jazyky 
   calls.length = 0;
   await dl.forceImport({ ...d, arrId: 1 }, { downloadId: 'HASH' });
   assert.strictEqual(calls.length, 0);
+});
+
+test('dvouciferné číslo série není rozsah ("Season 14" ≠ 1–4), kanály zvuku ani rok nejsou série', () => {
+  const cases = {
+    'South Park Season 14 (CZ/EN)': [14],
+    'The Simpsons Season 28': [28],
+    'The Grand Tour Season 03 1080p': [3],
+    'Season 02': [2],
+    'The Four Seasons 2025 S01': [1],
+    'Show Season 1 5.1 1080p': [1],
+    'Season 1-4': [1, 2, 3, 4],
+    'Season.1.4': [1, 2, 3, 4],
+    'Seasons 1 to 4': [1, 2, 3, 4],
+  };
+  for (const [t, want] of Object.entries(cases)) assert.deepStrictEqual(S.parseSeasons(t), want, t);
+});
+
+test('"řada" s háčkem na začátku slova a anglické "Series N"', () => {
+  assert.deepStrictEqual(S.parseSeasons('Přátelé řada 2'), [2]);
+  assert.deepStrictEqual(S.parseSeasons('Řada 1-3'), [1, 2, 3]);
+  assert.deepStrictEqual(S.parseSeasons('Show Series 3 1080p'), [3]);
+});
+
+test('počet epizod za číslem série není rozsah ("Season 1 25 Episodes")', () => {
+  assert.deepStrictEqual(S.parseSeasons('Seinfeld Season 1 25 Episodes 1080p'), [1]);
+  assert.deepStrictEqual(S.parseSeasons('Série 1 10 dílů'), [1]);
+  assert.deepStrictEqual(S.parseSeasons('Season 1-4'), [1, 2, 3, 4]);
+  assert.deepStrictEqual(S.parseSeasons('Season.1.4.'), [1, 2, 3, 4]);
 });

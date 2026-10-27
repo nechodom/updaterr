@@ -122,6 +122,10 @@ function reconcile(tag, detected, origLang) {
   if (LANGS.get(tag)?.confusable.includes(d)) {
     return d === origLang ? { lang: d, corrected: true } : { lang: tag, corrected: false };
   }
+  // Slyšet je jazyk, který se s primárním jazykem plete (stopa "eng", ve které Whisper slyší slovenštinu, když
+  // se hledá čeština): je to primární jazyk, nebo opravdu ten druhý? Jistá oprava to není – nechat značku a upozornit
+  const primary = require('./lang').primary();
+  if (primary && d !== primary && LANGS.get(d)?.confusable.includes(primary)) return { lang: tag, corrected: false, doubtful: true };
   return { lang: d, corrected: true };
 }
 

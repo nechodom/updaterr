@@ -9,9 +9,9 @@ const crypto = require('node:crypto');
 const L = require('./lang');
 const C = require('./codec');
 const S = require('./seasons');
-const { newId } = require('./store');
+const { newId, stagingFor } = require('./store');
 const { fileState, minCodec } = require('./library');
-const { mergeCandidates } = require('./merge');
+const { mergeCandidates, badDonorOf, badDonorCode, badDonorLengthMin, neededLang } = require('./merge');
 const W = require('./watch');
 const LC = require('./langcheck');
 const { t } = require('./i18n');
@@ -21,6 +21,8 @@ const { t } = require('./i18n');
 //  protože právě ta pravidla jazyk neřeší. "Multi-season releases are not supported" řešíme sami.)
 const HARD_REJECT = /unknown (movie|series)|unable to (match|parse|identify)|wrong (movie|series|season|episode)|blocklist|sample|hardcoded|already in (the )?(download )?queue|in (the )?queue already|not wanted in (this )?season|couldn.t find|does not match|wasn.t requested/i;
 const MULTI_SEASON_REJECT = /multi-season/i;
+// "Už je ve frontě" – u prvního stažení (firstgrab.js) nevadí, cizí stažení se případně zruší
+const QUEUE_REJECT = /queue/i;
 
 const CONF_RANK = { sure: 2, likely: 1, guess: 0 };
 const CONF_BY_RANK = ['guess', 'likely', 'sure'];
@@ -37,12 +39,19 @@ function itemLabel(item) {
 const groupKeyOf = (item) => `sonarr:${item.arrId}:multi`;
 
 // Stabilní krátké ID kandidáta (pro tlačítka ve webu, Telegramu a ntfy – pořadí se po přehledání mění)
-const candId = (c) => crypto.createHash('sha1').update(String(c.guid)).digest('hex').slice(0, 10);
+// Stejný release bývá v návrhu dvakrát (výměna souboru i přidání zvuku) – sloučení má proto vlastní ID,
+// jinak by tlačítko "Stáhnout" mohlo spustit sloučení (nebo naopak). Výměna si nechává původní ID.
+const hash10 = (s) => crypto.createHash('sha1').update(s).digest('hex').slice(0, 10);
+const candId = (c) => hash10(c.kind === 'merge' ? `merge|${c.guid}` : c.kind === 'cutmatch' ? `cutmatch|${c.guid}|${c.donor?.guid}` : String(c.guid));
 // Kandidát podle ID (řetězec), nebo podle pořadí (číslo – jen interní volání)
 function resolveCandidate(p, ref) {
   const list = p?.candidates || [];
   if (typeof ref === 'number') return ref >= 0 && ref < list.length ? ref : -1;
-  return list.findIndex((c) => candId(c) === String(ref));
+  const idx = list.findIndex((c) => candId(c) === String(ref));
+  if (idx >= 0) return idx;
+  // Starší tlačítko sloučení (ID jen z GUID): jen když je release v návrhu jednou, jinak by to bylo nejednoznačné
+  const legacy = list.map((c, i) => (hash10(String(c.guid)) === String(ref) ? i : -1)).filter((i) => i >= 0);
+  return legacy.length === 1 ? legacy[0] : -1;
 }
 
 // Stahování/slučování skončilo bez úspěchu a bez náhrady → návrh znovu otevřít se zbylými kandidáty
@@ -60,10 +69,30 @@ function reopenProposal(ctx, job, { dropGuid = null, note } = {}) {
   p.searchedAt = 0; // před dalším stažením znovu ověřit seedy
   delete p.grabbedIdx;
   delete p.grabbedGuid;
+  delete p.grabbedKind;
   delete p.downloadId;
   ctx.store.save();
 }
 const proposalKeys = (p) => p.itemKeys || [p.itemKey];
+
+// Po načtení knihovny: návrh počítal se soubory, které už neplatí (přibyla epizoda, soubor vyměněn mimo Updaterr) –
+// sada epizod by novou epizodu vynechala, sloučení by mířilo do jiného souboru. Návrh zahodit a hledat znovu.
+function expireStaleProposals(ctx) {
+  const { store } = ctx;
+  const ids = (list) => [...(list || [])].sort((a, b) => a - b).join();
+  let n = 0;
+  for (const p of Object.values(store.s.proposals || {})) {
+    if (p.status !== 'pending' || p.first || !p.current?.fileIds) continue;
+    const items = proposalKeys(p).map((k) => store.s.items[k]);
+    if (items.some((i) => !i || i.missing)) continue;
+    if (ids(items.flatMap((i) => i.current.fileIds || [])) === ids(p.current.fileIds)) continue;
+    Object.assign(p, { status: 'expired', note: t('search.stale.note'), updatedAt: new Date().toISOString() });
+    if (!ctx.busyKeys?.().has(p.itemKey)) ctx.searcher?.enqueue(p.itemKey, { reason: t('search.reason.libraryChange') });
+    store.log('info', t('search.stale.log', { label: p.label }));
+    n++;
+  }
+  return n;
+}
 
 // want – hledané jazyky položky (W.wantOf), null = oba jazyky; codec – hledaný formát videa (W.codecOf), null = neřešit
 function itemNeeds(item, settings, want = null, codec = null) {
@@ -72,7 +101,9 @@ function itemNeeds(item, settings, want = null, codec = null) {
   const quality = settings.qualityUpgrades && c.res > 0 && c.res < settings.maxResolution;
   // kodek, který MediaInfo neuvádí (null), se neřeší – nevíme, jestli je starší
   const vcodec = Boolean(codec) && c.vcodec != null && c.vcodec < C.wantRank(codec);
-  return { lang, quality, codec: vcodec, any: lang || quality || vcodec };
+  // useknutý/poškozený soubor (library.js truncationOf) – hledá se náhrada, i když jazyk sedí
+  const broken = Boolean(c.truncated);
+  return { lang, quality, codec: vcodec, broken, any: lang || quality || vcodec || broken };
 }
 
 // Souhrnný stav několika sérií (návrh/stahování balíku více sérií)
@@ -111,40 +142,67 @@ const releaseRes = (r) => L.resolutionOf(r.quality) || L.resolutionFromTitle(r.t
 const qualityName = (r, res) => (r.quality?.quality?.name && r.quality.quality.name !== 'Unknown' ? r.quality.quality.name : `${res}p`);
 const indexerName = (r) => String(r.indexer || '').replace(/\s*\(Prowlarr\)\s*$/i, '');
 
-// Je release lepší než současný stav? → { kind, warnings } nebo null
+// Kolik epizod série má teď lepší jazyk, než by měl release (série se hodnotí podle nejhorší epizody,
+// takže balík jen v primárním jazyce je pro sérii s jednou epizodou jen v druhém jazyce upgrade – ostatní
+// epizody s oběma jazyky by ale zhoršil)
+function worsenedEpisodes(cur, tier, sc = (x) => x) {
+  return (cur.tierCounts || []).reduce((a, n, x) => a + (sc(x) > sc(tier) ? n || 0 : 0), 0);
+}
+
+// Je release lepší než současný stav? → { kind, warnings, worse, worseText, lowerRes } nebo null
 //   sc – úroveň z pohledu hledaných jazyků (L.wantScore)
 //   vc – kodek releasu (C.codecOfTitle, null = neuveden), want – hledaná úroveň kodeku (C.wantRank, null = neřešit)
-function judge(cur, tier, res, st, sc = (t) => t, { vc = null, want = null } = {}) {
+//   langs – hledané jazyky (W.wantOf, null = oba): release bez nich se nenabízí ani kvůli kvalitě či formátu
+function judge(cur, tier, res, st, sc = (x) => x, { vc = null, want = null, langs = null } = {}) {
   const warnings = [];
+  let lowerRes = false;
+  const offTarget = Boolean(langs) && sc(tier) < 3;
   // S hledaným formátem upozornit, když by release kodek zhoršil (H.265 → H.264)
   const codecDrop = () => {
     if (want && cur.vcodec != null && vc != null && vc < cur.vcodec) warnings.push(t('search.warn.codecDrop', { from: C.nameOf(cur.vcodec), to: C.nameOf(vc) }));
   };
+  const lower = () => {
+    warnings.push(t('search.warn.lowerRes', { from: cur.res, to: res }));
+    lowerRes = true;
+  };
+  const verdict = (kind) => {
+    const worse = worsenedEpisodes(cur, tier, sc);
+    const worseText = worse ? t('search.warn.worsens', { count: worse, tier: L.tierLabel(tier) }) : null;
+    if (worseText) warnings.push(worseText);
+    return { kind, warnings, worse, worseText, ...(lowerRes ? { lowerRes: true } : {}) };
+  };
+  // Useknutý/poškozený soubor: náhrada celým souborem i se stejným jazykem (a klidně v nižším rozlišení)
+  if (cur.truncated && sc(tier) >= sc(cur.tier)) {
+    if (res < cur.res) lower();
+    codecDrop();
+    return verdict(sc(tier) > sc(cur.tier) ? 'language' : 'repair');
+  }
   if (sc(tier) > sc(cur.tier)) {
     if (res < cur.res) {
       if (!st.allowLowerQualityForLanguage) return null;
-      warnings.push(t('search.warn.lowerRes', { from: cur.res, to: res }));
-      return { kind: 'language', warnings, lowerRes: true };
+      lower();
     }
     codecDrop();
-    return { kind: 'language', warnings };
+    return verdict('language');
   }
+  // Release bez hledaných jazyků (jen primární jazyk hledaný, release jen v druhém) – kvalita ani formát na tom nic nemění
+  if (offTarget) return null;
   // Novější formát videa: hledaný kodek, jazyk ani rozlišení se nezhorší
   if (want && cur.vcodec != null && cur.vcodec < want && vc != null && vc >= want && sc(tier) >= sc(cur.tier) && res >= cur.res) {
-    return { kind: 'codec', warnings };
+    return verdict('codec');
   }
   if (tier === cur.tier && st.qualityUpgrades && res > cur.res) {
     codecDrop();
-    return { kind: 'quality', warnings };
+    return verdict('quality');
   }
   return null;
 }
 
 // Společné filtry releasu. Vrací důvod vyřazení (klíč do stats), nebo null.
-function basicReject(r, ctx, { allowMultiSeason = false } = {}) {
+function basicReject(r, ctx, { allowMultiSeason = false, ignoreQueue = false } = {}) {
   const st = ctx.store.settings;
   if (ctx.store.s.ignoredGuids[r.guid]) return 'ignored';
-  const rej = rejectionsOf(r).filter((x) => !(allowMultiSeason && MULTI_SEASON_REJECT.test(x)));
+  const rej = rejectionsOf(r).filter((x) => !(allowMultiSeason && MULTI_SEASON_REJECT.test(x)) && !(ignoreQueue && QUEUE_REJECT.test(x)));
   if (rej.some((x) => HARD_REJECT.test(x) || MULTI_SEASON_REJECT.test(x))) return 'rejected';
   if (L.JUNK_RE.test(r.title) || /cam|telesync|telecine|workprint|dvdscr/i.test(r.quality?.quality?.source || '')) return 'junk';
   if (r.protocol !== 'usenet' && (Number(r.seeders) || 0) < st.minSeeders) return 'dead';
@@ -188,6 +246,21 @@ function makeCandidate(r, { lang, tier, res, kind, warnings, lowerRes: lower = f
     // pro Sonarr override (balíky více sérií)
     arr: { quality: r.quality, languages: r.languages || [] },
   };
+}
+
+// Balík více sérií: jazyk zvlášť pro každou část názvu ("S01-S02 (CZ) / S03-S06 (EN)")
+function packLangs(r, evalOpts) {
+  const fullLang = L.evaluateRelease(r.title, evalOpts);
+  const segments = S.seasonSegments(r.title);
+  const langFor = (season) => {
+    const seg = segments.length > 1 ? segments.find((x) => x.seasons.includes(season)) : null;
+    if (!seg) return fullLang;
+    const p = L.parseReleaseTitle(seg.text);
+    if (!p.audio.size && !p.subs.size && !p.multi && !p.dual) return fullLang;
+    // Sonarr dává jazyky za celý release – do části s vlastním jazykem je nepouštět
+    return L.evaluateRelease(seg.text, { ...evalOpts, arrLangs: [] });
+  };
+  return { segments, langFor };
 }
 
 // Duplicity (stejný release na víc indexerech / víckrát) – necháme ten s nejvíc seedy, pak seřadit
@@ -257,34 +330,37 @@ function evaluateReleases(item, releases, ctx, { siblings } = {}) {
     if (!isMulti) {
       const lang = L.evaluateRelease(r.title, evalOpts);
       const tier = L.tierOf(lang, item.origLang);
-      const verdict = judge(cur, tier, res, st, sc, { vc: C.codecOfTitle(r.title), want: wantCodec });
+      const verdict = judge(cur, tier, res, st, sc, { vc: C.codecOfTitle(r.title), want: wantCodec, langs: want });
       if (!verdict) { stats.notBetter++; continue; }
       const warnings = verdict.warnings;
       if (!L.audioVerified(cur)) warnings.push(t('search.warn.currentGuessed'));
       if (lang.confidence === 'guess') warnings.push(t('search.warn.releaseGuess'));
       if (lowSeeds(r)) warnings.push(t('search.warn.lowSeeds'));
-      out.push(makeCandidate(r, { lang, tier, res, kind: verdict.kind, warnings, lowerRes: verdict.lowerRes }));
+      const cut = item.app === 'radarr' && otherCut(ctx, item, r);
+      if (cut) warnings.unshift(cut);
+      if (cur.truncated) warnings.unshift(truncatedWarning(cur));
+      const c = makeCandidate(r, { lang, tier, res, kind: verdict.kind, warnings, lowerRes: verdict.lowerRes });
+      if (verdict.worse) c.worsens = verdict.worse;
+      if (cut) c.otherEdition = true;
+      if (cur.truncated) c.replacesTruncated = true;
+      const why = mergeFailedNote(ctx, item, r);
+      if (why) {
+        c.notes.unshift(why.note);
+        c.badDonorId = why.id;
+      }
+      out.push(c);
       continue;
     }
 
-    // Balík více sérií: jazyk zvlášť pro každou část názvu ("S01-S02 (CZ) / S03-S06 (EN)")
     stats.multiSeason++;
-    const fullLang = L.evaluateRelease(r.title, evalOpts);
-    const segments = S.seasonSegments(r.title);
-    const langFor = (season) => {
-      const seg = segments.length > 1 ? segments.find((x) => x.seasons.includes(season)) : null;
-      if (!seg) return fullLang;
-      const p = L.parseReleaseTitle(seg.text);
-      if (!p.audio.size && !p.subs.size && !p.multi && !p.dual) return fullLang;
-      // Sonarr dává jazyky za celý release – do části s vlastním jazykem je nepouštět
-      return L.evaluateRelease(seg.text, { ...evalOpts, arrLangs: [] });
-    };
+    const { segments, langFor } = packLangs(r, evalOpts);
     const seasonTiers = {};
     const targets = [];
     const warnings = new Set();
     let kind = 'quality';
     let shown = null; // jazyk nejslabší nahrazované série (pro vlajky a jistotu)
     let lower = false;
+    let worsens = 0;
     for (const s of seasons) {
       const lang = langFor(s);
       const tier = L.tierOf(lang, item.origLang);
@@ -292,20 +368,23 @@ function evaluateReleases(item, releases, ctx, { siblings } = {}) {
       const sib = seasonItems[s];
       if (!sib) continue; // série, kterou v knihovně nemáme – v balíku je navíc
       if (sib !== item && sib.ignoredUntil && Date.parse(sib.ignoredUntil) > Date.now()) continue;
-      const verdict = judge(sib.current, tier, res, st, sc, { vc: C.codecOfTitle(r.title), want: wantCodec });
+      const verdict = judge(sib.current, tier, res, st, sc, { vc: C.codecOfTitle(r.title), want: wantCodec, langs: want });
       if (!verdict) continue;
       targets.push(s);
       if (verdict.kind === 'language') kind = 'language';
       else if (verdict.kind === 'codec' && kind !== 'language') kind = 'codec';
       if (verdict.lowerRes) lower = true;
-      verdict.warnings.forEach((w) => warnings.add(w));
+      verdict.warnings.filter((w) => w !== verdict.worseText).forEach((w) => warnings.add(w));
+      worsens += verdict.worse || 0;
       if (!L.audioVerified(sib.current)) warnings.add(t('search.warn.currentGuessed'));
       if (!shown || tier < shown.tier || (tier === shown.tier && CONF_RANK[lang.confidence] < CONF_RANK[shown.lang.confidence])) shown = { lang, tier };
     }
     if (!targets.includes(item.season)) { stats.notBetter++; continue; }
+    if (worsens) warnings.add(t('search.warn.worsensPack', { count: worsens }));
     if (shown.lang.confidence === 'guess') warnings.add(t('search.warn.releaseGuess'));
     if (lowSeeds(r)) warnings.add(t('search.warn.lowSeeds'));
     const c = makeCandidate(r, { lang: shown.lang, tier: shown.tier, res, kind, warnings: [...warnings], lowerRes: lower });
+    if (worsens) c.worsens = worsens;
     const extra = seasons.filter((s) => !targets.includes(s));
     c.notes.unshift(extra.length
       ? t('search.note.multiPackReplaces', { seasons: S.formatSeasons(seasons), targets: S.formatSeasons(targets), count: targets.length })
@@ -323,8 +402,132 @@ function evaluateReleases(item, releases, ctx, { siblings } = {}) {
   }
 
   const merges = mergeCandidates(item, releases, ctx, { HARD_REJECT, rejectionsOf, isLocalIndexer });
-  return { candidates: rank(out, wantCodec), multi: rank(multi, wantCodec), merges, stats };
+  // Dabing ke stávající verzi (sloučení bez jiného střihu) je lepší než výměna verze – tu pak nenabízet
+  const combos = merges.some((m) => !m.otherCut) ? [] : cutMatchCandidates(item, releases, ctx);
+  return { candidates: rank(out, wantCodec), multi: rank(multi, wantCodec), merges, combos, stats };
 }
+
+// Výměna celého souboru za jinou verzi filmu (kino verze místo Extended) – upozornit, ať se nestáhne bez schválení.
+// Jistě to víme, když tenhle release už neprošel sloučením kvůli délce; jinak jen podle názvu.
+// U useknutého souboru délka o verzi nic neříká – zbývá jen název.
+function otherCut(ctx, item, r) {
+  const bad = !item.current.truncated && badDonorOf(ctx.store, item.key, r);
+  const min = badDonorLengthMin(bad);
+  if (min) return t('search.warn.otherCutLength', { min });
+  return L.editionWarning(item.current.sceneName, r.title);
+}
+
+// Bonusové disky a doprovodné materiály – nejsou film, jako obraz pro výměnu se nehodí
+const EXTRAS_RE = /\b(bonus|featurettes?|extras|special[ ._-]features|behind[ ._-]the[ ._-]scenes|appendices)\b/i;
+
+// Slot ('pri' | 'sec') jazyka s kódem `code` (neededLang vrací kód)
+const slotOf = (code) => (code === L.primary() ? 'pri' : 'sec');
+
+// Dabing existuje jen k jiné verzi filmu, než je stávající soubor (dabing ke kino verzi, soubor Extended), nebo je
+// soubor useknutý: nabídnout dvojici – release ve stejném jazyce jako teď, ale ve verzi, ke které dabing podle
+// názvu sedí, a po jeho importu do něj přidat zvuk z donoru (downloads.js chainMerge). Obraz se tak nezhorší
+// (oproti výměně za 720p release s dabingem). Jen filmy, vždy jen po schválení.
+function cutMatchCandidates(item, releases, ctx) {
+  const st = ctx.store.settings;
+  const cur = item.current;
+  if (item.app !== 'radarr' || !st.mergeEnabled || !ctx.qbit?.enabled || !stagingFor(st, item.app) || !L.audioVerified(cur)) return [];
+  const need = neededLang(item, W.wantOf(ctx.store, item));
+  if (!need) return [];
+  const needSlot = slotOf(need);
+  const haveSlot = needSlot === 'pri' ? 'sec' : 'pri';
+  const curCut = L.editionOf(cur.sceneName);
+  const donors = [];
+  const bases = [];
+  for (const r of releases) {
+    if (basicReject(r, ctx) || EXTRAS_RE.test(r.title)) continue;
+    const lang = L.evaluateRelease(r.title, { origLang: item.origLang, arrLangs: r.languages, localIndexer: isLocalIndexer(r.indexer, st) });
+    if (lang.confidence === 'guess') continue;
+    const x = { r, lang, res: releaseRes(r), cut: L.editionOf(r.title) };
+    const sizeGB = (r.size || 0) / 1024 ** 3;
+    if (lang[needSlot]) {
+      if (r.protocol === 'usenet' || sizeGB > st.mergeMaxDonorGB) continue;
+      // Donor, který k souboru nesedí jen délkou, se k nové verzi hodit může; jiné selhání (mrtvý torrent) ne
+      const bad = badDonorOf(ctx.store, item.key, r);
+      if (bad && badDonorCode(bad) !== 'length') continue;
+      // Verzi poznáme jen z názvu – donor musí být podle názvu jiná verze než soubor (u useknutého jakákoli)
+      if (!cur.truncated && (x.cut.key === curCut.key || !otherCut(ctx, item, r))) continue;
+      donors.push(x);
+    } else if (lang[haveSlot] && sizeGB <= st.maxMovieSizeGB && !/br-?disk/i.test(r.quality?.quality?.name || '')) {
+      bases.push(x);
+    }
+  }
+  const conf = (l) => CONF_RANK[l.confidence];
+  const seeds = (r) => Math.floor(Math.log2((Number(r.seeders) || 0) + 1));
+  // Obraz: napřed releasy, které nejsou výrazně menší než stávající soubor (nezhorší datový tok – u useknutého
+  // to nejde poznat), se zdravým počtem seedů a lepším zdrojem; pak víc seedů a menší stahování
+  const big = (x) => Boolean(cur.truncated || !cur.size || (x.r.size || 0) >= cur.size * 0.7);
+  const healthy = (x) => (Number(x.r.seeders) || 0) >= st.minSeeders * 3;
+  donors.sort((a, b) => Number(b.lang.pri && b.lang.sec) - Number(a.lang.pri && a.lang.sec) || conf(b.lang) - conf(a.lang) || seeds(b.r) - seeds(a.r) || a.r.size - b.r.size);
+  bases.sort((a, b) => b.res - a.res || Number(big(b)) - Number(big(a)) || Number(healthy(b)) - Number(healthy(a)) || conf(b.lang) - conf(a.lang) ||
+    L.qualityRank(b.r.quality) - L.qualityRank(a.r.quality) || seeds(b.r) - seeds(a.r) || a.r.size - b.r.size);
+
+  const out = [];
+  const cuts = new Set();
+  for (const d of donors) {
+    if (cuts.has(d.cut.key)) continue;
+    // Obraz nesmí být horší než teď (u useknutého než z donoru) a donor sám nesmí být lepší volba.
+    // Dva nejlepší obrazy – ať je na výběr mezi menším stahováním a lepší kvalitou.
+    const fit = bases.filter((x) => x.cut.key === d.cut.key && x.res >= (cur.truncated ? d.res : cur.res) && !(d.lang[haveSlot] && d.res >= x.res)).slice(0, 2);
+    if (!fit.length) continue;
+    cuts.add(d.cut.key);
+    for (const b of fit) out.push(cutMatchCandidate(item, b, d, { need, haveSlot, curCut, conf, st }));
+  }
+  return out.slice(0, 2);
+}
+
+// Kandidát z dvojice obraz (b) + zdroj zvuku (d)
+function cutMatchCandidate(item, b, d, { need, haveSlot, curCut, conf, st }) {
+  const cur = item.current;
+  const lang = { pri: true, sec: true, confidence: CONF_BY_RANK[Math.min(conf(b.lang), conf(d.lang))], notes: [] };
+  const warnings = [];
+  if (cur.truncated) warnings.push(truncatedWarning(cur));
+  else warnings.push(t('search.cut.warnOther', { cur: curCut.label, rel: b.cut.label, lang: L.label(need) }));
+  warnings.push(t('search.cut.warnByTitle'));
+  if (Number(b.r.seeders) < st.minSeeders * 3) warnings.push(t('search.warn.lowSeeds'));
+  if (Number(d.r.seeders) < st.minSeeders * 3) warnings.push(t('search.cut.warnDonorSeeds'));
+  const c = makeCandidate(b.r, { lang, tier: L.tierOf(lang, item.origLang), res: b.res, kind: 'cutmatch', warnings });
+  c.baseTier = L.tierOf(b.lang, item.origLang);
+  c.baseSize = c.size;
+  c.size += d.r.size || 0;
+  c.seeders = c.seeders == null ? Number(d.r.seeders) || 0 : Math.min(c.seeders, Number(d.r.seeders) || 0);
+  c.notes = [t('search.cut.note', {
+    cut: b.cut.label, quality: c.quality, have: L.label(L.slotCode(haveSlot)), lang: L.label(need), title: d.r.title,
+    gb: ((d.r.size || 0) / 1024 ** 3).toFixed(1), seeders: d.r.seeders,
+  })];
+  c.donor = { guid: d.r.guid, indexerId: d.r.indexerId, indexer: indexerName(d.r), title: d.r.title, size: d.r.size || 0, seeders: Number(d.r.seeders) || 0, mergeLang: need, infoHash: d.r.infoHash || null };
+  if (!cur.truncated) c.otherEdition = true;
+  return c;
+}
+
+// Kam v návrhu zařadit dvojici z cutMatchCandidates: před první volbu, která je horší (nižší jazyk, horší obraz,
+// jiná verze filmu, náhrada useknutého souboru) – sloučení stop ke stávajícímu souboru (stejná verze) zůstane napřed
+function withCutMatch(top, combos) {
+  if (!combos.length) return top;
+  const worse = (c) => !(c.kind === 'merge' && !c.otherCut) &&
+    (c.tier < combos[0].tier || c.otherEdition || c.otherCut || c.replacesTruncated || lowerRes(c));
+  const i = top.findIndex(worse);
+  return i < 0 ? [...top, ...combos] : [...top.slice(0, i), ...combos, ...top.slice(i)];
+}
+
+// Proč u releasu chybí "Přidat zvuk": sloučení s ním už jednou neprošlo (badDonors) – nabízí se jen výměna
+// celého souboru. Délku hlásí už otherCut jako varování, tady jen ostatní důvody (synchronizace, …).
+// Vrací { note, id } – id záznamu, aby šlo donor rovnou z návrhu odblokovat a zkusit znovu.
+function mergeFailedNote(ctx, item, r) {
+  if (item.current.truncated) return null;
+  const bad = badDonorOf(ctx.store, item.key, r);
+  if (!bad || badDonorCode(bad) === 'length') return null;
+  // starší záznamy mají před důvodem "Nic nešlo sloučit: "
+  const reason = String(bad.reason || t('search.mergeFailed')).replace(/^Nic nešlo sloučit:\s*/, '');
+  return { note: t('search.note.mergeFailed', { reason }), id: bad.id };
+}
+
+// Varování u každé náhrady useknutého souboru (W.autoAllowed ji bez schválení nestáhne)
+const truncatedWarning = (cur) => t('search.warn.truncated', { file: cur.truncated.fileMin, runtime: cur.truncated.runtimeMin });
 
 // Pořadí v návrhu: sloučení stop napřed, když náhrada celého souboru cíl nesplní nebo zhorší obraz
 function arrange(main, merges) {
@@ -409,6 +612,8 @@ function evaluateEpisodeSet(item, releases, ctx, { episodes, files }) {
     if (confidence === 'guess') warnings.add(t('search.warn.releaseGuess'));
     if (seeders != null && seeders < st.minSeeders * 3) warnings.add(t('search.warn.lowSeeds'));
     const first = parts[0].r;
+    // Série ještě vychází / chybí epizody: sada nahradí jen to, co v knihovně je
+    const partial = item.episodeCount > have.length ? t('search.note.setPartial', { have: have.length, total: item.episodeCount }) : null;
     return {
       set: true,
       guid,
@@ -428,7 +633,7 @@ function evaluateEpisodeSet(item, releases, ctx, { episodes, files }) {
       confidence,
       notes: [kept.length
         ? t('search.note.episodesKept', { eps: epRanges(nums), kept: epRanges(kept), lang: want ? L.wantLabel(want) : L.tierLabel(goal), count: kept.length })
-        : t('search.note.episodes', { eps: epRanges(nums) })],
+        : t('search.note.episodes', { eps: epRanges(nums) }), ...(partial ? [partial] : [])],
       kind: 'language',
       warnings: [...warnings],
       ...(lower ? { lowerRes: true } : {}),
@@ -446,13 +651,104 @@ function evaluateEpisodeSet(item, releases, ctx, { episodes, files }) {
   return null;
 }
 
-async function findEpisodeSet(ctx, item, releases) {
+// Přidání zvuku ze sady jednotlivých epizod: série nemá donor s celou sérií, ale chybějící jazyk má každá epizoda,
+// které chybí, ve vlastním torrentu. Video zůstává stávající, z torrentů se bere jen zvuková stopa (merge.js).
+function mergeSetPossible(ctx, item) {
+  const st = ctx.store.settings;
+  return item.app === 'sonarr' && st.mergeEnabled && ctx.qbit?.enabled && stagingFor(st, item.app) && L.audioVerified(item.current) && !item.current.truncated
+    && Boolean(neededLang(item, W.wantOf(ctx.store, item)));
+}
+
+function evaluateMergeSet(item, releases, ctx, { episodes, files }) {
+  if (!mergeSetPossible(ctx, item)) return null;
+  const st = ctx.store.settings;
+  const need = neededLang(item, W.wantOf(ctx.store, item));
+  // Které epizody jazyk nemají – jako Merger.targets (po poslechu značkám nevěřit, rozhodne až slučování)
+  const heard = item.current.audioSource === 'poslech';
+  const needing = episodes
+    .filter((e) => e.seasonNumber === item.season && e.hasFile && files[e.episodeFileId])
+    .filter((e) => heard || !L.audioFromMediaInfo(files[e.episodeFileId].mediaInfo?.audioLanguages)[slotOf(need)]);
+  if (!needing.length) return null;
+
+  const opts = [];
+  for (const r of releases) {
+    if (r.fullSeason || r.protocol === 'usenet') continue;
+    const eps = (r.mappedEpisodeInfo || []).filter((e) => e.seasonNumber === item.season);
+    if (!eps.length || (r.mappedSeasonNumber ?? r.seasonNumber) !== item.season) continue;
+    const why = basicReject(r, ctx);
+    if (why && why !== 'res') continue; // rozlišení nevadí – obraz se z donoru nebere
+    if (badDonorOf(ctx.store, item.key, r)) continue;
+    if ((r.size || 0) / 1024 ** 3 / eps.length > st.maxEpisodeSizeGB) continue;
+    const lang = L.evaluateRelease(r.title, { origLang: item.origLang, arrLangs: r.languages, localIndexer: isLocalIndexer(r.indexer, st) });
+    if (!lang[slotOf(need)] || lang.confidence === 'guess') continue;
+    opts.push({ r, lang, dual: Boolean(lang.pri && lang.sec), ids: eps.map((e) => e.id), nums: eps.map((e) => e.episodeNumber) });
+  }
+  if (!opts.length) return null;
+
+  // Každá epizoda bez jazyka musí mít donor; pořadí jako u donorů s celou sérií (mergeCandidates)
+  const seeds = (o) => Math.floor(Math.log2((Number(o.r.seeders) || 0) + 1));
+  const better = st.mergeSaveData
+    ? (a, b) => CONF_RANK[b.lang.confidence] - CONF_RANK[a.lang.confidence] || (a.r.size || 0) / a.nums.length - (b.r.size || 0) / b.nums.length || Number(b.dual) - Number(a.dual) || seeds(b) - seeds(a)
+    : (a, b) => Number(b.dual) - Number(a.dual) || CONF_RANK[b.lang.confidence] - CONF_RANK[a.lang.confidence] || seeds(b) - seeds(a) || (a.r.size || 0) - (b.r.size || 0);
+  const chosen = new Map();
+  for (const ep of needing) {
+    const fits = opts.filter((o) => o.ids.includes(ep.id));
+    if (!fits.length) return null;
+    const best = fits.find((o) => chosen.has(o.r.guid)) || fits.sort(better)[0];
+    chosen.set(best.r.guid, best);
+  }
+  const parts = [...chosen.values()].sort((a, b) => Math.min(...a.nums) - Math.min(...b.nums));
+  if (parts.length > st.maxEpisodeSetParts) return null;
+  const guid = 'mset:' + crypto.createHash('sha1').update(parts.map((p) => p.r.guid).sort().join('\n')).digest('hex').slice(0, 16);
+  if (ctx.store.s.ignoredGuids[guid]) return null;
+
+  const confidence = CONF_BY_RANK[Math.min(...parts.map((p) => CONF_RANK[p.lang.confidence]))];
+  const seeders = Math.min(...parts.map((p) => Number(p.r.seeders) || 0));
+  const dual = parts.every((p) => p.dual);
+  const nums = [...new Set(parts.flatMap((p) => p.nums))].sort((a, b) => a - b);
+  const first = parts[0].r;
+  return {
+    set: true,
+    guid,
+    indexerId: first.indexerId,
+    indexer: [...new Set(parts.map((p) => indexerName(p.r)))].join(', '),
+    title: parts.length > 1 ? t('search.set.title', { count: nums.length, title: first.title, more: parts.length - 1 }) : first.title,
+    size: parts.reduce((a, p) => a + (p.r.size || 0), 0),
+    seeders,
+    leechers: Math.min(...parts.map((p) => Number(p.r.leechers) || 0)),
+    protocol: 'torrent',
+    quality: item.current.quality,            // video zůstává stávající
+    res: item.current.res,
+    qrank: item.current.qrank,
+    tier: 3,
+    pri: true,
+    sec: true,
+    confidence,
+    notes: [t('search.mset.note', { lang: L.label(need), quality: item.current.quality }),
+      t('search.mset.episodes', { eps: epRanges(nums) }),
+      ...(dual ? [t('search.mset.dual', { p: L.label(L.primary()), s: L.label(L.secondary()) })] : [])],
+    kind: 'merge',
+    mergeLang: need,
+    dualDonor: dual,
+    warnings: seeders < st.minSeeders * 3 ? [t('search.warn.lowSeeds')] : [],
+    otherCut: false,
+    ageDays: Math.max(...parts.map((p) => Math.round(p.r.ageHours != null ? p.r.ageHours / 24 : p.r.age || 0))),
+    infoUrl: parts.length === 1 ? first.infoUrl || first.commentUrl || null : null,
+    parts: parts.map((p) => ({
+      guid: p.r.guid, indexerId: p.r.indexerId, title: p.r.title, size: p.r.size || 0, protocol: p.r.protocol,
+      seeders: Number(p.r.seeders) || 0, episodeIds: p.ids, episodes: p.nums, dualDonor: p.dual,
+      infoHash: p.r.infoHash || null, downloadUrl: p.r.downloadUrl || null, magnetUrl: p.r.magnetUrl || null,
+    })),
+    searchedAt: Date.now(),
+  };
+}
+
+async function seasonFiles(ctx, item) {
   const [episodes, fileList] = await Promise.all([
     ctx.sonarr.get('/episode', { seriesId: item.arrId }),
     ctx.sonarr.get('/episodefile', { seriesId: item.arrId }),
   ]);
-  const files = Object.fromEntries(fileList.map((f) => [f.id, f]));
-  return evaluateEpisodeSet(item, releases, ctx, { episodes, files });
+  return { episodes, files: Object.fromEntries(fileList.map((f) => [f.id, f])) };
 }
 
 async function fetchReleases(ctx, item) {
@@ -467,7 +763,7 @@ function siblingsOf(ctx, item) {
   const { store } = ctx;
   const busy = ctx.busyKeys();
   return Object.fromEntries(Object.values(store.s.items)
-    .filter((x) => x.app === 'sonarr' && x.arrId === item.arrId && x.key !== item.key && !busy.has(x.key))
+    .filter((x) => x.app === 'sonarr' && x.arrId === item.arrId && x.key !== item.key && !x.missing && !busy.has(x.key))
     .map((x) => [x.season, x]));
 }
 
@@ -475,6 +771,7 @@ function siblingsOf(ctx, item) {
 function rejectProposal(ctx, p, days = 3650) {
   const { store } = ctx;
   if (p.status === 'grabbed') throw new Error(t('err.proposalDownloading'));
+  if (ctx.inflight?.has(p.id)) throw new Error(t('server.err.approving'));
   p.status = 'rejected';
   p.updatedAt = new Date().toISOString();
   const until = Number(days) > 0 ? new Date(Date.now() + Number(days) * 86400e3).toISOString() : null;
@@ -537,6 +834,8 @@ function upsertGroupProposal(ctx, item, fresh, { reason, silent }) {
 
 // Hledání pro jednu položku. Vytvoří/aktualizuje návrh(y) a případně spustí automatické stažení.
 async function searchItem(ctx, item, { reason = t('search.reason.schedule'), silent = false } = {}) {
+  // Položka bez souboru (první stažení) – hodnotí se jinak, není co upgradovat (firstgrab.js)
+  if (item.missing) return ctx.firstGrab.search(item, { reason });
   const { store } = ctx;
   const st = store.settings;
   const t0 = Date.now();
@@ -551,24 +850,28 @@ async function searchItem(ctx, item, { reason = t('search.reason.schedule'), sil
   // Během hledání (i minuty) mohla položka zmizet z knihovny
   if (!store.s.items[item.key]) return { proposal: null, groupProposal: null, candidates: [] };
   item = store.s.items[item.key];
-  let { candidates, multi, merges, stats } = evaluateReleases(item, releases, ctx, { siblings: siblingsOf(ctx, item) });
+  let { candidates, multi, merges, combos, stats } = evaluateReleases(item, releases, ctx, { siblings: siblingsOf(ctx, item) });
   // Než se něco nabídne: ověřit jazyk stávajícího souboru poslechem (značky stop občas lžou)
-  if ((candidates.length || multi.length || merges.length) && LC.needsCheck(ctx, item)) {
+  if ((candidates.length || multi.length || merges.length || combos.length) && LC.needsCheck(ctx, item)) {
     try {
       const r = await LC.verify(ctx, item, { reason });
-      if (r.changed) ({ candidates, multi, merges, stats } = evaluateReleases(item, releases, ctx, { siblings: siblingsOf(ctx, item) }));
+      if (r.changed) ({ candidates, multi, merges, combos, stats } = evaluateReleases(item, releases, ctx, { siblings: siblingsOf(ctx, item) }));
     } catch (e) {
       item.langCheck = { fileIds: item.current.fileIds, at: new Date().toISOString(), error: e.message, corrected: false };
       store.log('warn', t('search.langCheckFailed', { label: itemLabel(item), error: e.message }));
     }
   }
-  let top = arrange(candidates.slice(0, st.candidatesPerProposal), merges);
+  let top = withCutMatch(arrange(candidates.slice(0, st.candidatesPerProposal), merges), combos);
 
-  // Žádný balík → zkusit sadu jednotlivých epizod
-  if (item.app === 'sonarr' && st.episodeSets && !candidates.length && !multi.length && !merges.length) {
+  // Žádný balík → zkusit sadu jednotlivých epizod; žádný donor s celou sérií → přidat zvuk z torrentů epizod
+  const wantSet = item.app === 'sonarr' && st.episodeSets && !candidates.length && !multi.length && !merges.length;
+  const wantMergeSet = !merges.length && mergeSetPossible(ctx, item) && releases.some((r) => !r.fullSeason);
+  if (wantSet || wantMergeSet) {
     try {
-      const set = await findEpisodeSet(ctx, item, releases);
-      if (set) top = [set];
+      const sf = await seasonFiles(ctx, item);
+      const set = wantSet ? evaluateEpisodeSet(item, releases, ctx, sf) : null;
+      const mset = wantMergeSet ? evaluateMergeSet(item, releases, ctx, sf) : null;
+      top = arrange(set ? [set] : top, mset ? [mset] : []);
     } catch (e) {
       store.log('warn', t('search.episodeSetFailed', { label: itemLabel(item), error: e.message }));
     }
@@ -658,7 +961,7 @@ class Searcher {
     const now = Date.now();
     const busyKeys = this.ctx.busyKeys();
     return Object.values(store.s.items)
-      .filter((it) => (it.app === 'radarr' ? st.scanRadarr : st.scanSonarr))
+      .filter((it) => !it.missing && (it.app === 'radarr' ? st.scanRadarr : st.scanSonarr))
       .filter((it) => itemNeeds(it, st, W.wantOf(store, it), W.codecOf(store, it)).any)
       .filter((it) => !busyKeys.has(it.key))
       .filter((it) => !(it.ignoredUntil && Date.parse(it.ignoredUntil) > now))
@@ -688,7 +991,7 @@ class Searcher {
     }
     if (!job) return;
     const item = store.s.items[job.key];
-    if (!item) return;
+    if (!item || item.missing) return;
     if (this.ctx.busyKeys().has(item.key)) {
       store.log('info', t('search.skippedBusy', { label: itemLabel(item) }));
       return;
@@ -711,7 +1014,7 @@ class Searcher {
 }
 
 module.exports = {
-  Searcher, searchItem, evaluateReleases, evaluateEpisodeSet, fetchReleases, itemNeeds, itemLabel, seasonLabel,
-  combineCurrent, rejectProposal, reopenProposal, proposalKeys, groupKeyOf, HARD_REJECT, rejectionsOf, isLocalIndexer,
-  candId, resolveCandidate, lowerRes,
+  Searcher, searchItem, evaluateReleases, evaluateEpisodeSet, evaluateMergeSet, fetchReleases, itemNeeds, itemLabel, seasonLabel,
+  combineCurrent, rejectProposal, reopenProposal, proposalKeys, expireStaleProposals, groupKeyOf, HARD_REJECT, rejectionsOf, isLocalIndexer,
+  candId, resolveCandidate, lowerRes, cutMatchCandidates, withCutMatch, basicReject, makeCandidate, rank, releaseRes, packLangs, judge, worsenedEpisodes,
 };

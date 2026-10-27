@@ -5,9 +5,12 @@ services:
       # Read API keys straight from Radarr/Sonarr config.xml (instead of RADARR_API_KEY / SONARR_API_KEY in .env)
       - /path/to/radarr/config.xml:/arr/radarr.xml:ro
       - /path/to/sonarr/config.xml:/arr/sonarr.xml:ro
+      # Optional: Jellyseerr config folder (the whole folder – Jellyseerr replaces settings.json when saving)
+      # - /path/to/jellyseerr/config:/jellyseerr:ro
     environment:
       - RADARR_CONFIG=/arr/radarr.xml
       - SONARR_CONFIG=/arr/sonarr.xml
+      # - JELLYSEERR_CONFIG=/jellyseerr/settings.json
     # The Docker network Radarr/Sonarr/qBittorrent run in (then URLs like http://radarr:7878 work)
     networks:
       - arr

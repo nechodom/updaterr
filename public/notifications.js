@@ -5,7 +5,7 @@
    ========================================================================== */
 (() => {
   const NC = { list: [], unread: 0, filter: lsGet('nc.filter', 'all'), open: false, seen: null, json: '' };
-  const KIND_ICON = { proposal: 'sparkles', download: 'download', merge: 'merge', syncfix: 'refresh', backup: 'archive', error: 'alert' };
+  const KIND_ICON = { proposal: 'sparkles', download: 'download', merge: 'merge', syncfix: 'refresh', backup: 'archive', langcheck: 'headphones', error: 'alert' };
   const FILTERS = [['all', t('common.all')], ['unread', t('notif.filter.unread')], ['problems', t('notif.filter.problems')]];
   const btn = $('#nc-btn');
   const panel = $('#nc-panel');
@@ -126,10 +126,7 @@
     setOpen(false);
     btn.focus();
     const l = n.link || {};
-    if (l.proposal && n.open) {
-      S.highlight = l.proposal;
-      return showTab('proposals');
-    }
+    if (l.proposal && n.open) return openProposal(l.proposal);
     if (l.job) {
       const jobs = await api('GET', 'downloads').catch(() => []);
       const byId = new Map(jobs.map((j) => [j.id, j]));

@@ -18,7 +18,8 @@ const SAMPLE = process.env.WHISPER_TEST_WAV || '/models/jfk.wav';
 const RETRY_AFTER_MS = 30 * 60e3;
 
 // Stav posledního použití – co se stalo při skutečné práci (ne při testu)
-const state = { device: null, lastUsedAt: null, lastError: null, failedAt: 0, cpuFallbacks: 0 };
+// badResults = test ukázal, že GPU počítá špatně (nespadne, jen dává chybné jazyky) → nepoužívat do dalšího úspěšného ověření
+const state = { device: null, lastUsedAt: null, lastError: null, failedAt: 0, cpuFallbacks: 0, badResults: false };
 
 function renderNodes() {
   let names = [];
@@ -37,7 +38,7 @@ const binaryOk = () => fs.existsSync(BIN);
 
 // Může se GPU teď použít? (binárka, zařízení s přístupem, nedávno neselhalo)
 function usable() {
-  return binaryOk() && renderNodes().some((n) => n.access) && Date.now() - state.failedAt > RETRY_AFTER_MS;
+  return !state.badResults && binaryOk() && renderNodes().some((n) => n.access) && Date.now() - state.failedAt > RETRY_AFTER_MS;
 }
 
 // Z výstupu whisper-cli: jaké zařízení Vulkan našel a jestli ho whisper opravdu použil
@@ -158,6 +159,13 @@ async function check({ model }) {
   if (steps.every((s) => s.ok)) {
     state.failedAt = 0;
     state.lastError = null;
+    state.badResults = false;
+  } else {
+    // Výpočet proběhl, ale s chybným výsledkem – skutečná práce by tiše dávala špatné jazyky
+    const bad = steps.find((s) => !s.ok);
+    state.badResults = true;
+    state.failedAt = Date.now();
+    state.lastError = t('gpu.checkFailed', { step: bad.label, detail: bad.detail });
   }
   return done({ device: b.device, model: path.basename(model), gpu, cpu });
 }

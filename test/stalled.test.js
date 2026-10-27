@@ -68,3 +68,25 @@ test('qBittorrent 4: pausedDL se bere jako zastavený', () => {
   const recs = { h1: { name: 'Film', stoppedAt: 0, tries: 1 } };
   assert.strictEqual(plan([tor('pausedDL', { tags: TAG })], recs, S, 120 * MIN).start.length, 1);
 });
+
+test('stahování Updaterru se nezastavuje (má vlastní pravidlo pro mrtvé torrenty), zastavené se pustí', () => {
+  const recs = {};
+  const skip = new Set(['h1']);
+  plan([tor('stalledDL', { hash: 'H1' })], recs, { ...S, skip }, 0);
+  assert.deepStrictEqual(plan([tor('stalledDL', { hash: 'H1' })], recs, { ...S, skip }, 60 * MIN).stop, []);
+  const p = plan([tor('stoppedDL', { hash: 'H1', tags: TAG })], recs, { ...S, skip }, 61 * MIN);
+  assert.strictEqual(p.start.length, 1);
+  assert.strictEqual(p.untag.length, 1);
+});
+
+test('když spuštění v qBittorrentu selže a torrent pořád stojí, zkusí se znovu', () => {
+  const recs = {};
+  const o = { enabled: true, stallMin: 30, retryMin: 60 };
+  const t = { hash: 'h', name: 'x', state: 'stalledDL', tags: 'updaterr-stalled', progress: 0 };
+  plan([t], recs, o, 0);
+  plan([t], recs, o, 31 * 60e3);
+  const s = { ...t, state: 'stoppedDL' };
+  assert.strictEqual(plan([s], recs, o, 92 * 60e3).start.length, 1);
+  assert.strictEqual(plan([s], recs, o, 100 * 60e3).start.length, 0, 'ne hned znovu');
+  assert.strictEqual(plan([s], recs, o, 153 * 60e3).start.length, 1, 'po retryMin od pokusu znovu');
+});

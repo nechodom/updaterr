@@ -94,6 +94,12 @@ class QbitClient {
     return list?.[0] || null;
   }
 
+  // Torrenty podle info hashů (malými i velkými písmeny)
+  async byHashes(hashes) {
+    if (!hashes.length) return [];
+    return (await this.req('torrents/info', { query: { hashes: hashes.map((h) => String(h).toLowerCase()).join('|') } })) || [];
+  }
+
   files(hash) { return this.req('torrents/files', { query: { hash } }); }
 
   setFilePriority(hash, ids, priority) {
@@ -101,13 +107,8 @@ class QbitClient {
     return this.req('torrents/filePrio', { method: 'POST', form: new URLSearchParams({ hash, id: ids.join('|'), priority: String(priority) }) });
   }
 
-  properties(hash) { return this.req('torrents/properties', { query: { hash } }); }
-
-  // Stav kusů torrentu: 0 = nestažený, 1 = stahuje se, 2 = stažený
-  pieceStates(hash) { return this.req('torrents/pieceStates', { query: { hash } }); }
-
   /**
-   * Sekvenční stahování + priorita prvního/posledního kusu (začátek videa napřed).
+   * Sekvenční stahování + priorita prvního/posledního kusu (začátek videa napřed); dnes jen vypnutí u starších úloh.
    * API je umí jen přepínat, takže podle stavu `t` z torrents/info (seq_dl, f_l_piece_prio).
    */
   async prioritizeStart(t, on) {
@@ -131,6 +132,8 @@ class QbitClient {
 
   addTags(hashes, tags) { return this.req('torrents/addTags', { method: 'POST', form: new URLSearchParams({ hashes, tags }) }); }
   removeTags(hashes, tags) { return this.req('torrents/removeTags', { method: 'POST', form: new URLSearchParams({ hashes, tags }) }); }
+  // Smaže tagy úplně (ze seznamu tagů qBittorrentu), ne jen z torrentů; `tags` jsou oddělené čárkou
+  deleteTags(tags) { return this.req('torrents/deleteTags', { method: 'POST', form: new URLSearchParams({ tags }) }); }
 
   delete(hash, deleteFiles = true) {
     return this.req('torrents/delete', { method: 'POST', form: new URLSearchParams({ hashes: hash, deleteFiles: String(deleteFiles) }) });

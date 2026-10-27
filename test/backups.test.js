@@ -87,12 +87,15 @@ test('přehled: velikost, sdílené hardlinky a zálohy bez úlohy', () => {
     assert.strictEqual(byId.ccc.keep, 'orphan');
     assert.strictEqual(byId.ccc.expiresAt, null);
     assert.strictEqual(byId.aaa.type, 'merge');
+    // aaa ještě není ověřená → drží se aspoň 30 dní od dokončení, přehled ukazuje skutečný termín (ne backupUntil)
+    assert.strictEqual(byId.aaa.expiresAt, byId.aaa.finishedAt + 30 * DAY);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('nová retence platí i pro stávající zálohy, vlastní termín ji přebije', () => {
   const { root, ctx, b } = setup();
   try {
+    for (const j of [ctx.store.s.merges.aaa, ctx.store.s.syncFixes.bbb]) j.backupCheck = { status: 'ok' }; // ověřené
     b.keep('aaa', { days: 30 });
     assert.deepStrictEqual(b.retention({ days: 7, maxGB: 0 }), []); // aaa by jinak (10 dní) šla pryč
     b.keep('aaa', { reset: true });
@@ -113,6 +116,7 @@ test('nová retence platí i pro stávající zálohy, vlastní termín ji přeb
 test('natrvalo a ruční smazání', () => {
   const { root, ctx, b, logs } = setup();
   try {
+    for (const j of [ctx.store.s.merges.aaa, ctx.store.s.syncFixes.bbb]) j.backupCheck = { status: 'ok' }; // ověřené
     b.keep('aaa', { forever: true });
     assert.deepStrictEqual(b.retention({ days: 0, maxGB: 0 }).map((x) => x.id), ['bbb']);
     b.remove('ccc', 'ručně');
@@ -137,10 +141,10 @@ test('ověřené sloučení se s deleteVerified maže hned, ke kontrole a vlastn
 });
 
 test('kontrola souboru v knihovně proti záloze', () => {
-  const j = { type: 'merge', need: 'cz' };
+  const j = { type: 'merge', need: 'cs' };
   const r = { fileId: 1, offsetMs: 113, verifyMs: 0, via: 'CZ stopa přímo proti EN', outSize: 500 };
   const bak = { video: {}, duration: 6000, audio: [{ lang: 'en' }] };
-  const good = { video: {}, duration: 6000.5, audio: [{ lang: 'en' }, { lang: 'cz' }] };
+  const good = { video: {}, duration: 6000.5, audio: [{ lang: 'en' }, { lang: 'cs' }] };
   const lib = { fileId: 2, size: 500 };
   assert.deepStrictEqual(fileIssues(j, r, { lib, libProbe: good, bakProbe: bak }), []);
   assert.match(fileIssues(j, r, { lib: { fileId: 1 }, libProbe: good, bakProbe: bak })[0], /původní soubor/);
@@ -148,7 +152,7 @@ test('kontrola souboru v knihovně proti záloze', () => {
   assert.match(fileIssues(j, r, { lib, libProbe: { ...good, audio: [{ lang: 'en' }] }, bakProbe: bak }).join(), /chybí přidaná CZ/);
   assert.match(fileIssues(j, r, { lib, libProbe: { ...good, duration: 5900 }, bakProbe: bak }).join(), /kratší/);
   assert.match(fileIssues(j, r, { lib: { fileId: 2, size: 999 }, libProbe: good, bakProbe: bak }).join(), /změnil/);
-  assert.match(fileIssues(j, { ...r, offsetMs: 28149 }, { lib, libProbe: good, bakProbe: bak }).join(), new RegExp(`${(28.1).toLocaleString('cs')} s`)); // 28,1 (bez plných ICU dat v Node 28.1)
+  assert.match(fileIssues(j, { ...r, offsetMs: 28149 }, { lib, libProbe: good, bakProbe: bak }).join(), /28\.1 s/);
   assert.match(fileIssues(j, { ...r, verifyMs: -62 }, { lib, libProbe: good, bakProbe: bak }).join(), /62 ms/);
   assert.match(fileIssues(j, r, { lib, libProbe: good, bakProbe: bak, meas: { ok: true, offsetMs: 300 } }).join(), /300 ms/);
   assert.match(fileIssues(j, r, { lib, libProbe: good, bakProbe: null }).join(), /záloha/);
@@ -163,7 +167,7 @@ test('ověření úloh: v pořádku se smaže (je-li zapnuto), odchylka zůstane
   const { root, ctx, b, logs } = setup();
   try {
     const now = Date.now();
-    Object.assign(ctx.store.s.merges.aaa, { app: 'radarr', itemKey: 'radarr:1', need: 'cz', finishedAt: now - DAY, backupUntil: now + 6 * DAY,
+    Object.assign(ctx.store.s.merges.aaa, { app: 'radarr', itemKey: 'radarr:1', need: 'cs', finishedAt: now - DAY, backupUntil: now + 6 * DAY,
       results: [{ ok: true, target: 'Film A.mkv', path: '/lib/Film A.mkv', fileId: 10, offsetMs: 100, verifyMs: 0, via: 'CZ stopa přímo proti EN' }] });
     Object.assign(ctx.store.s.syncFixes.bbb, { app: 'sonarr', itemKey: 'sonarr:5:1',
       results: [{ ok: true, target: 'B E01.mkv', path: '/lib/Film B.mkv', fileId: 20, episodeIds: [7], offsetMs: 300, applied: [{ verifyMs: 70 }] }] });
@@ -172,7 +176,7 @@ test('ověření úloh: v pořádku se smaže (je-li zapnuto), odchylka zůstane
     const sent = [];
     ctx.notify = { backupReview: async (j) => sent.push(j.id) };
     b.probe = async (p) => (p.includes('backup') ? { video: {}, duration: 100, audio: [{ lang: 'en' }] }
-      : p.includes('new A') ? { video: {}, duration: 100, audio: [{ lang: 'en' }, { lang: 'cz' }] }
+      : p.includes('new A') ? { video: {}, duration: 100, audio: [{ lang: 'en' }, { lang: 'cs' }] }
       : { video: {}, duration: 100, audio: [{ lang: 'en' }] });
     assert.strictEqual(b.list().find((x) => x.id === 'aaa').check.status, 'pending');
     await b.verify();
@@ -215,12 +219,26 @@ test('Radarr/Sonarr neodpovídá → zůstane čekat na ověření, nic se nema�
 
 test('přidaný zvuk: jazyk, kodek a rozsah posunu ze sloučených souborů', () => {
   const r = (offsetMs, added, ok = true) => ({ ok, offsetMs, added });
-  const ac3 = { lang: 'cz', codec: 'ac3', channels: 6 };
-  assert.deepStrictEqual(addedAudio({ type: 'merge', need: 'cz', results: [r(980, ac3)] }),
-    { lang: 'cz', tracks: [{ codec: 'ac3', channels: 6 }], offsetMs: [980, 980] });
+  const ac3 = { lang: 'cs', codec: 'ac3', channels: 6 };
+  assert.deepStrictEqual(addedAudio({ type: 'merge', need: 'cs', results: [r(980, ac3)] }),
+    { lang: 'cs', tracks: [{ codec: 'ac3', channels: 6 }], offsetMs: [980, 980] });
   // Starší úloha bez kodeku, nepovedený soubor se nepočítá
   assert.deepStrictEqual(addedAudio({ type: 'merge', need: 'en', results: [r(-110), r(0), r(5000, null, false)] }),
     { lang: 'en', tracks: [], offsetMs: [-110, 0] });
-  assert.strictEqual(addedAudio({ type: 'merge', need: 'cz', results: [r(0, ac3, false)] }), null);
+  assert.strictEqual(addedAudio({ type: 'merge', need: 'cs', results: [r(0, ac3, false)] }), null);
   assert.strictEqual(addedAudio({ type: 'syncfix', results: [r(0)] }), null);
+});
+
+test('záloha ke kontrole nebo ještě neověřená se po retenci ani kvůli místu nemaže (drží se aspoň 30 dní)', () => {
+  const old = NOW - 10 * DAY;
+  const list = [
+    bk('ok', { finishedAt: old, createdAt: 1, check: { status: 'ok' } }),
+    bk('rev', { finishedAt: old, createdAt: 2, check: { status: 'review' } }),
+    bk('pend', { finishedAt: old, createdAt: 3, check: { status: 'pending' } }),
+  ];
+  assert.deepStrictEqual(plan(list, { days: 7 }, NOW), [{ id: 'ok', why: 'age' }]);
+  assert.deepStrictEqual(plan(list, { days: 0 }, NOW).map((x) => x.id), ['ok']);
+  assert.deepStrictEqual(plan(list, { days: 365, maxBytes: 1 }, NOW).map((x) => x.id), ['ok']);
+  assert.strictEqual(expiryAt(list[1], 7), old + 30 * DAY);
+  assert.deepStrictEqual(plan(list, { days: 7 }, old + 31 * DAY).map((x) => x.id), ['ok', 'rev', 'pend']);
 });

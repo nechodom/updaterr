@@ -36,6 +36,24 @@ function fileState(file, origLang) {
   };
 }
 
+// Délka z MediaInfo ("H:MM:SS", "MM:SS", případně s desetinami sekund) → sekundy, null = neznámá
+function parseRunTime(v) {
+  const m = String(v ?? '').trim().match(/^(?:(\d+):)?(\d{1,2}):(\d{2})(?:[.,]\d+)?$/);
+  if (!m) return null;
+  const sec = (Number(m[1]) || 0) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+  return sec > 0 ? sec : null;
+}
+
+// Soubor filmu výrazně kratší než film (useknutý/poškozený, ne jiná verze) → { fileMin, runtimeMin }, jinak null.
+// Jen Radarr; když délku filmu nebo souboru neznáme, nic neříkáme.
+const TRUNCATED_RATIO = 0.6;
+function truncationOf(movie) {
+  const runtimeMin = Number(movie?.runtime) || 0;
+  const sec = parseRunTime(movie?.movieFile?.mediaInfo?.runTime);
+  if (!runtimeMin || !sec || sec >= runtimeMin * 60 * TRUNCATED_RATIO) return null;
+  return { fileMin: Math.round(sec / 60), runtimeMin };
+}
+
 // Nejstarší známý kodek (u série nejhorší epizoda), null = žádný soubor ho neuvádí
 function minCodec(states) {
   const known = states.map((x) => x.vcodec).filter((v) => v != null);
@@ -79,8 +97,9 @@ async function syncRadarr(ctx) {
       title: m.title, year: m.year, poster: posterOf(m.images), monitored: m.monitored,
       origLang, originalLanguage: m.originalLanguage?.name,
       addedAt: m.movieFile.dateAdded,
-      current: { ...cur, fileIds: [m.movieFile.id], files: 1, sceneName: m.movieFile.sceneName || m.movieFile.relativePath },
+      current: { ...cur, fileIds: [m.movieFile.id], files: 1, sceneName: m.movieFile.sceneName || m.movieFile.relativePath, truncated: truncationOf(m) },
     });
+    delete store.s.items[key].missing; // první stažení (firstgrab.js) je v knihovně
     applyLangCheck(store.s.items[key]);
   }
   return seen;
@@ -116,6 +135,7 @@ async function syncSonarr(ctx) {
           addedAt: sf.map((f) => f.dateAdded).sort().pop(),
           current: seasonState(sf, origLang),
         });
+        delete store.s.items[key].missing;
         applyLangCheck(store.s.items[key]);
       }
     }
@@ -134,6 +154,10 @@ async function syncLibrary(ctx) {
     try {
       const seen = await fn(ctx);
       counts[name] = seen.size;
+      // Chybějící položky, které Updaterr právě stahuje poprvé (firstgrab.js) – soubor ještě nemají, nemazat
+      for (const [key, it] of Object.entries(store.s.items)) {
+        if (it.missing && key.startsWith(name + ':') && !seen.has(key) && ctx.firstGrab?.tracked(key)) seen.add(key);
+      }
       // Položky, které z Radarru/Sonarru zmizely (smazané filmy/série), zahodit
       for (const key of Object.keys(store.s.items)) {
         if (key.startsWith(name + ':') && !seen.has(key)) delete store.s.items[key];
@@ -147,6 +171,8 @@ async function syncLibrary(ctx) {
       store.log('error', I18N.t('library.syncFailed', { app: name, error: e.message }));
     }
   }
+  // líně – search.js načítá library.js
+  require('./search').expireStaleProposals(ctx);
   store.s.lastSync = new Date().toISOString();
   store.save();
   store.log('info', I18N.t('library.loaded', { sec: ((Date.now() - t0) / 1000).toFixed(1), counts: Object.entries(counts).map(([k, v]) => `${k} ${v}`).join(', ') }));
@@ -158,7 +184,7 @@ async function refreshItem(ctx, item) {
     const m = await ctx.radarr.get(`/movie/${item.arrId}`);
     if (!m.movieFile) return null;
     const cur = fileState(m.movieFile, item.origLang);
-    return { ...cur, fileIds: [m.movieFile.id], files: 1, sceneName: m.movieFile.sceneName || m.movieFile.relativePath, mediaInfoKnown: cur.audioSource === 'mediainfo' };
+    return { ...cur, fileIds: [m.movieFile.id], files: 1, sceneName: m.movieFile.sceneName || m.movieFile.relativePath, truncated: truncationOf(m), mediaInfoKnown: cur.audioSource === 'mediainfo' };
   }
   const files = (await ctx.sonarr.get('/episodefile', { seriesId: item.arrId })).filter((f) => f.seasonNumber === item.season);
   if (!files.length) return null;
@@ -166,4 +192,4 @@ async function refreshItem(ctx, item) {
   return { ...st, mediaInfoKnown: st.audioSource === 'mediainfo' };
 }
 
-module.exports = { syncLibrary, refreshItem, fileState, minCodec };
+module.exports = { syncLibrary, refreshItem, fileState, minCodec, posterOf, parseRunTime, truncationOf, TRUNCATED_RATIO };

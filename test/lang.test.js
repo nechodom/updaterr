@@ -108,4 +108,72 @@ test('hledané jazyky – jen CZ: EN se nenabízí, CZ ano, CZ + EN není lepš�
   assert.strictEqual(itemNeeds(czItem, DEFAULT_SETTINGS, null).lang, true);
   assert.strictEqual(neededLang(czItem, ['pri']), null, 'EN stopu nepřidávat');
   assert.strictEqual(neededLang({ ...czItem, current: { tier: 1 } }, ['pri']), 'cs');
+
+  // EN 720p → EN 1080p není u "Jen CZ" upgrade kvality (ani balík více sérií); bez omezení ano
+  const enItem = { ...item, origLang: 'en', current: { ...item.current, tier: 1, res: 720, qrank: 20 } };
+  const enRel = rel('en1080', 'Show S01 1080p BluRay x265');
+  assert.strictEqual(evaluateReleases(enItem, [enRel], ctx).candidates.length, 0);
+  assert.deepStrictEqual(evaluateReleases(enItem, [enRel], free).candidates.map((c) => c.guid), ['en1080']);
+  const sib = { ...enItem, season: 2, key: 'sonarr:35:2' };
+  const pack = rel('pack', 'Show S01-S02 1080p BluRay x265');
+  assert.strictEqual(evaluateReleases(enItem, [pack], ctx, { siblings: { 2: sib } }).multi.length, 0);
+  assert.strictEqual(evaluateReleases(enItem, [pack], free, { siblings: { 2: sib } }).multi.length, 1);
+});
+
+test('skupiny v názvu: řetěz jazyků nepřetéká přes závorky a "+"', () => {
+  assert.strictEqual(tier('Duna (2021)[1080p](CZ/EN)(CZ titulky)', { origLang: 'en' }), 3);
+  assert.strictEqual(tier('Duna (2021)(CZ) + EN titulky', { origLang: 'en' }), 2);
+  const p = L.parseReleaseTitle('Duna (2021)(CZ) + EN titulky');
+  assert.deepStrictEqual([...p.audio], ['cs']);
+  assert.deepStrictEqual([...p.subs], ['en']);
+  assert.ok(!p.tokens.includes('|'), 'hranice skupin nejsou mezi slovy');
+  // uvnitř jedné skupiny řetěz dál platí
+  assert.strictEqual(tier('Duna (2021)[1080p](CZ, EN titulky)', { origLang: 'en' }), 1);
+});
+
+test('jazykové zkratky v názvu díla nejsou jazyk releasu', () => {
+  assert.strictEqual(tier('En.man.som.heter.Ove.2015.1080p.BluRay.x264', { origLang: 'other' }), 0, 'švédský film, ne EN');
+  assert.strictEqual(tier('En.man.som.heter.Ove.2015.1080p.BluRay.CZ.dabing', { origLang: 'other' }), 2);
+  // samostatná zkratka před rokem pořád platí
+  assert.strictEqual(tier('[CZ] Avatar (2009) 1080p', { origLang: 'en' }), 2);
+  assert.strictEqual(tier('Avatar CZ 2009 1080p', { origLang: 'en' }), 2);
+  assert.strictEqual(tier('CZ - Avatar (2009) 1080p', { origLang: 'en' }), 2);
+});
+
+test('DUAL/MULTI u českého originálu = čeština je mezi stopami', () => {
+  assert.strictEqual(tier('Pelisky.1999.1080p.DUAL', { origLang: 'cs' }), 3);
+  assert.strictEqual(tier('Pelisky.1999.1080p.BluRay.MultiDub.x264', { origLang: 'cs' }), 3);
+});
+
+test('MULTI z CZ trackeru s CZ titulky neznamená CZ dabing', () => {
+  const opts = { origLang: 'en', localIndexer: true };
+  assert.strictEqual(tier('Film.2020.1080p.WEB-DL.MULTI + CZ titulky', opts), 1);
+  assert.strictEqual(L.evaluateRelease('Film.2020.1080p.WEB-DL.MULTI + CZ titulky', opts).subsPri, true);
+  assert.strictEqual(tier('Film.2020.1080p.WEB-DL.MULTI', opts), 3, 'bez titulků pořád odhad CZ');
+});
+
+test('série se smíšenými epizodami: balík, který část epizod zhorší, se nabídne s varováním a nestáhne sám', () => {
+  const { judge, worsenedEpisodes } = require('../src/search');
+  const { autoAllowed } = require('../src/watch');
+  const st = { ...DEFAULT_SETTINGS, autoGrab: 'any' };
+  // 9 epizod CZ + EN, jedna jen EN → série je "EN" (nejhorší epizoda)
+  const cur = { tier: 1, res: 1080, tierCounts: [0, 1, 0, 9] };
+  assert.strictEqual(worsenedEpisodes(cur, 2), 9);
+  assert.strictEqual(worsenedEpisodes(cur, 3), 0);
+  const v = judge(cur, 2, 1080, st);
+  assert.strictEqual(v.kind, 'language');
+  assert.strictEqual(v.worse, 9);
+  assert.ok(v.warnings.some((w) => w.startsWith('zhorší 9 epizod')), v.warnings.join());
+  assert.deepStrictEqual(judge(cur, 3, 1080, st).warnings, [], 'CZ + EN balík nic nezhorší');
+  assert.match(judge({ tier: 1, res: 1080, tierCounts: [0, 1, 0, 3] }, 2, 1080, st).warnings[0], /zhorší 3 epizody/);
+  assert.match(judge({ tier: 1, res: 1080, tierCounts: [0, 1, 0, 1] }, 2, 1080, st).warnings[0], /zhorší 1 epizodu/);
+
+  // celý průchod: kandidát nese počet a automatika ho nevezme
+  const ctx = { store: { settings: st, s: { ignoredGuids: {}, watchSeries: {} } } };
+  const item = { app: 'sonarr', arrId: 5, season: 1, key: 'sonarr:5:1', origLang: 'en', episodeCount: 10, current: { ...cur, qrank: 34, audioSource: 'mediainfo' } };
+  const rel = { guid: 'p', indexerId: 1, indexer: 'SkTorrent', title: 'Show S01 (CZ)[1080p]', seeders: 200, leechers: 0, size: 8e9, protocol: 'torrent', fullSeason: true, seasonNumber: 1, quality: { quality: { name: 'WEBDL-1080p', resolution: 1080, source: 'web' } }, rejections: [], languages: [] };
+  const [c] = evaluateReleases(item, [rel], ctx).candidates;
+  assert.strictEqual(c.worsens, 9);
+  assert.strictEqual(autoAllowed(ctx.store, item, c), false);
+  assert.strictEqual(autoAllowed(ctx.store, item, { ...c, worsens: undefined, warnings: [] }), true, 'bez zhoršení by šel');
 });

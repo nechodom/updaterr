@@ -6,7 +6,7 @@
 // Výsledek se ukládá k položce: item.syncCheck = { offsetMs, matched, at, …, files: { [fileId]: měření } }.
 //
 // Oprava (jen po kliknutí): CZ stopy se znovu změří na všech 8 místech, mkvmerge --sync je posune do nového
-// souboru, ten se změří znovu, originál se zazálohuje (hardlink do stagingDir/backup jako u slučování)
+// souboru, ten se změří znovu (v místech, kde měření před opravou vyšlo spolehlivě), originál se zazálohuje (hardlink do stagingDir/backup jako u slučování)
 // a nový soubor se naimportuje přes Radarr/Sonarr (ManualImport). Knihovna se do té doby nemění.
 const fs = require('node:fs');
 const path = require('node:path');
@@ -14,13 +14,14 @@ const L = require('./lang');
 const A = require('./audio');
 const { newId, stagingFor } = require('./store');
 const { refreshItem } = require('./library');
-const { backupOriginal, isTransient } = require('./merge');
+const { backupOriginal, assertReplaceable, isTransient } = require('./merge');
 const { itemLabel } = require('./search');
 const I18N = require('./i18n');
 
 const CHECK_OPTS = { maxOffsetSec: 10, earlyStop: true, lowPriority: true };
 const MEASURE_OPTS = { maxOffsetSec: 10 };                        // před opravou: všech 8 míst
-const VERIFY_OPTS = { maxOffsetSec: 5, anchors: 6, minValid: 4 }; // výsledek opravy (jako u slučování)
+// Výsledek opravy se ověřuje v místech, kde stopy spolehlivě korelovaly už před opravou (A.verifyOpts)
+const verifyOpts = (m) => A.verifyOpts(m, MEASURE_OPTS);
 const FIX_MIN_MS = 40;              // menší posun stopy při opravě nechat být
 const VERIFY_MAX_MS = 40;           // po opravě musí stopy sedět aspoň takhle
 const ERROR_RETRY_MS = 24 * 3600e3; // chyba čtení souboru → zkusit znovu za den
@@ -454,11 +455,12 @@ class DubSync {
       j.message = I18N.t('sync.measuringTrack', { track: trackLabel(d), name: t.name });
       const r = await A.checkSync(T(p, tr.ref), T(p, d), MEASURE_OPTS);
       if (d === tr.primary) primary = r;
-      if (r.ok && Math.abs(r.offsetMs) > FIX_MIN_MS) shifts.push({ track: d, offsetMs: r.offsetMs, matched: r.matched });
+      if (r.ok && Math.abs(r.offsetMs) > FIX_MIN_MS) shifts.push({ track: d, offsetMs: r.offsetMs, matched: r.matched, verify: verifyOpts(r) });
     }
     if (!primary.ok) throw new Error(I18N.t('sync.cannotMeasure', { reason: primary.reason }));
     const base = { target: t.name, fileId: t.fileId, offsetMs: primary.offsetMs, matched: primary.matched, track: trackLabel(tr.primary), ref: trackLabel(tr.ref) };
     if (!shifts.length) return { ...base, skipped: true };
+    assertReplaceable(t.path);
 
     // Nový soubor: všechno beze změny, jen CZ stopy posunuté
     const outDir = path.join(j.dir, 'out');
@@ -483,7 +485,7 @@ class DubSync {
     if (op.audio.length !== p.audio.length || op.audio.some((a, i) => a.lang !== p.audio[i].lang)) throw new Error(I18N.t('sync.resultTracksMismatch'));
     const applied = [];
     for (const s of shifts) {
-      const v = await A.checkSync(T(op, op.audio[tr.ref.audioIndex]), T(op, op.audio[s.track.audioIndex]), VERIFY_OPTS);
+      const v = await A.checkSync(T(op, op.audio[tr.ref.audioIndex]), T(op, op.audio[s.track.audioIndex]), s.verify);
       if (!v.ok || Math.abs(v.offsetMs) > VERIFY_MAX_MS) {
         throw new Error(I18N.t('sync.verifyFailed', { track: trackLabel(s.track), reason: v.ok ? `${v.offsetMs} ms` : v.reason }));
       }

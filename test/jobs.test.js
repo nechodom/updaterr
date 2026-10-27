@@ -61,7 +61,31 @@ test('během schvalování je položka pro ostatní zaneprázdněná', async () 
   assert.ok(ctx.busyKeys().has('radarr:1'), 'po odeslání běží stahování');
 });
 
+test('během schvalování je známý schvalovaný kandidát (web pak nenabízí znovu „Stáhnout“)', async () => {
+  const { ctx, cand, release } = setup();
+  const first = ctx.grab('p1', candId(cand));
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(ctx.inflight.get('p1'), cand.guid);
+  release();
+  await first;
+  assert.ok(!ctx.inflight.has('p1'));
+});
+
 test('neznámé ID kandidáta → srozumitelná chyba', async () => {
   const { ctx } = setup();
   await assert.rejects(ctx.grab('p1', 'neexistuje'), /už v návrhu není/);
+});
+
+test('stejný release jako výměna i sloučení má různá ID – tlačítko spustí správnou akci', () => {
+  const { resolveCandidate } = require('../src/search');
+  const guid = 'https://tracker/x?id=same';
+  const p = { candidates: [{ guid, kind: 'merge' }, { guid, kind: 'language' }] };
+  assert.notStrictEqual(candId(p.candidates[0]), candId(p.candidates[1]));
+  assert.strictEqual(resolveCandidate(p, candId(p.candidates[0])), 0);
+  assert.strictEqual(resolveCandidate(p, candId(p.candidates[1])), 1);
+  // Starší tlačítko sloučení (ID jen z GUID) se přijme, jen když je release v návrhu jednou
+  const legacy = require('node:crypto').createHash('sha1').update(guid).digest('hex').slice(0, 10);
+  assert.strictEqual(resolveCandidate({ candidates: [{ guid, kind: 'merge' }] }, legacy), 0);
+  assert.strictEqual(resolveCandidate(p, legacy), 1); // = ID výměny (nezměněné)
+  assert.strictEqual(resolveCandidate(p, 'neexistuje'), -1);
 });

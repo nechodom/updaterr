@@ -63,7 +63,9 @@ class Notifier {
 
   candidateLine(c, i) {
     const what = c.kind === 'merge'
-      ? I18N.t('notify.cand.merge', { lang: L.label(c.mergeLang), conf: conf(c.confidence) })
+      ? I18N.t('notify.cand.merge', { lang: L.label(c.mergeLang), conf: conf(c.confidence) }) + (c.parts?.length > 1 ? I18N.t('notify.cand.mergeParts', { count: c.parts.length }) : '')
+      : c.kind === 'cutmatch'
+      ? I18N.t('notify.cand.cutmatch', { lang: L.label(c.donor.mergeLang), conf: conf(c.confidence), quality: c.quality, title: esc(c.donor.title) })
       : `${flag(c)} <b>${L.tierLabel(c.tier)}</b>${conf(c.confidence)} · ${c.quality}${c.vcodecName ? ` · ${c.kind === 'codec' ? `<b>${c.vcodecName}</b>` : c.vcodecName}` : ''}${c.parts?.length > 1 ? I18N.t('notify.cand.set', { count: c.parts.length }) : ''}`;
     return `${i + 1}. ${what} · ${c.seeders ?? '?'}↑ ${c.leechers ?? '?'}↓ · ${gb(c.size)} · ${esc(c.indexer)}\n   <code>${esc(c.title)}</code>` +
       (c.warnings.length ? `\n   ⚠️ ${esc(c.warnings.join(', '))}` : '');
@@ -93,7 +95,7 @@ class Notifier {
       }) : '',
       link: { proposal: p.id, item: p.itemKey },
     });
-    if (this.telegram) {
+    const tg = async () => {
       const n = Math.min(5, p.candidates.length);
       const keyboard = [
         p.candidates.slice(0, n).map((c, i) => ({ text: `${c.kind === 'merge' ? '🔀' : '⬇️'} ${i + 1}`, callback_data: `g|${p.id}|${candId(c)}` })),
@@ -106,8 +108,8 @@ class Notifier {
       });
       p.tgMessageId = msg.message_id;
       this.ctx.store.save();
-    }
-    if (this.ntfy) {
+    };
+    const ntfy = async () => {
       const c = p.candidates[0];
       const actions = [];
       if (this.publicUrl) {
@@ -126,7 +128,8 @@ class Notifier {
         tags: [c.tier === 3 ? `flag-${(LANGS.get(L.primary())?.country || 'white').toLowerCase()}` : 'arrow_up'],
         actions,
       });
-    }
+    };
+    await this.all([this.telegram && tg, this.ntfy && ntfy]);
   }
 
   // Notifikační centrum ve webu – ukládá se vždy, i bez Telegramu/ntfy
@@ -134,9 +137,10 @@ class Notifier {
     if (!this.ctx.inbox) return;
     const what = I18N.t(d.type === 'merge' ? 'notify.inbox.what.merge' : d.type === 'syncfix' ? 'notify.inbox.what.syncfix' : 'notify.inbox.what.download');
     const ev = {
-      grabbed: { level: 'info', title: `${I18N.t(d.type === 'merge' ? 'notify.grabbed.audio' : 'notify.grabbed.file')}${d.auto ? I18N.t('notify.tag.auto') : ''}${d.retryOf ? I18N.t('notify.inbox.retry', { attempt: d.attempt }) : ''}`, text: d.title },
+      grabbed: { level: 'info', title: `${I18N.t(d.type === 'merge' ? 'notify.grabbed.audio' : d.first ? 'notify.grabbed.new' : 'notify.grabbed.file')}${d.auto && !d.first ? I18N.t('notify.tag.auto') : ''}${d.retryOf ? I18N.t('notify.inbox.retry', { attempt: d.attempt }) : ''}`, text: d.title },
       done: d.type === 'syncfix' ? { level: 'ok', title: I18N.t('notify.inbox.syncFixed'), text: d.message }
         : d.warning ? { level: 'warn', title: I18N.t('notify.inbox.doneWarn'), text: d.warning }
+        : d.first ? { level: 'ok', title: I18N.t('notify.inbox.downloaded'), text: `${L.tierLabel(d.result?.tier)}${d.result?.audio ? ` (${d.result.audio}, ${d.result.quality})` : ''}` }
         : { level: 'ok', title: I18N.t(d.type === 'merge' ? 'notify.inbox.audioAdded' : 'notify.inbox.upgradeDone'), text: `${L.tierLabel(d.prev?.tier)} → ${L.tierLabel(d.result?.tier)}${d.result?.audio ? ` (${d.result.audio}, ${d.result.quality})` : ''}` },
       failed: { level: 'error', title: I18N.t('notify.inbox.failed', { what }), text: d.message },
       blocked: { level: 'error', title: I18N.t('notify.inbox.blocked'), text: d.message },
@@ -156,14 +160,16 @@ class Notifier {
     if (!this.enabled || !st.notifyDownloads) return;
     const texts = {
       grabbed: I18N.t('notify.grabbed', {
-        what: I18N.t(d.type === 'merge' ? 'notify.grabbed.audio' : 'notify.grabbed.file'),
-        auto: d.auto ? I18N.t('notify.tag.auto') : '', retry: d.retryOf ? I18N.t('notify.tag.retry', { attempt: d.attempt }) : '',
+        what: I18N.t(d.type === 'merge' ? 'notify.grabbed.audio' : d.first ? 'notify.grabbed.new' : 'notify.grabbed.file'),
+        auto: d.auto && !d.first ? I18N.t('notify.tag.auto') : '', retry: d.retryOf ? I18N.t('notify.tag.retry', { attempt: d.attempt }) : '',
         label: esc(d.label), title: esc(d.title),
       }),
       done: d.type === 'syncfix'
         ? `✅ <b>${esc(d.label)}</b>: ${esc(d.message)}`
         : d.warning
         ? I18N.t('notify.doneWarn', { label: esc(d.label), warning: esc(d.warning) })
+        : d.first
+        ? I18N.t('notify.doneFirst', { label: esc(d.label), tier: L.tierLabel(d.result?.tier), audio: esc(d.result?.audio), quality: esc(d.result?.quality) })
         : `✅ <b>${esc(d.label)}</b>: ${L.tierLabel(d.prev.tier)} → <b>${L.tierLabel(d.result?.tier)}</b> (${esc(d.result?.audio)}, ${esc(d.result?.quality)})`,
       failed: `❌ <b>${esc(d.label)}</b>: ${esc(d.message)}`,
       blocked: I18N.t('notify.blocked', { label: esc(d.label), message: esc(d.message) }),
@@ -192,15 +198,30 @@ class Notifier {
     await this.send(I18N.t(j.type === 'syncfix' ? 'notify.review.syncfix' : 'notify.review.merge', { label: esc(j.label), lines: lines.join('\n'), link }));
   }
 
+  // Kanály se posílají souběžně a nezávisle: výpadek Telegramu nesmí zastavit ntfy (a naopak).
+  // Chyby se nakonec ohlásí všechny najednou.
+  async all(senders) {
+    const names = [];
+    const tasks = [];
+    senders.forEach((fn, i) => { if (fn) { names.push(i === 0 ? 'Telegram' : 'ntfy'); tasks.push(fn()); } });
+    const res = await Promise.allSettled(tasks);
+    const errors = res.map((r, i) => (r.status === 'rejected' ? `${names[i]}: ${r.reason?.message || r.reason}` : null)).filter(Boolean);
+    if (errors.length) throw new Error(errors.join('; '));
+  }
+
   async send(html) {
-    if (this.telegram) await this.tg('sendMessage', { chat_id: this.tgChat, text: html, parse_mode: 'HTML', disable_web_page_preview: true });
-    if (this.ntfy) await this.ntfySend({ title: 'Updaterr', message: html.replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&') });
+    await this.all([
+      this.telegram && (() => this.tg('sendMessage', { chat_id: this.tgChat, text: html, parse_mode: 'HTML', disable_web_page_preview: true })),
+      this.ntfy && (() => this.ntfySend({ title: 'Updaterr', message: html.replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&') })),
+    ]);
   }
 
   async test() {
     if (!this.enabled) throw new Error(I18N.t('err.noNotify'));
-    if (this.telegram) await this.tg('sendMessage', { chat_id: this.tgChat, text: I18N.t('notify.test.telegram') });
-    if (this.ntfy) await this.ntfySend({ title: 'Updaterr', message: I18N.t('notify.test.ntfy') });
+    await this.all([
+      this.telegram && (() => this.tg('sendMessage', { chat_id: this.tgChat, text: I18N.t('notify.test.telegram') })),
+      this.ntfy && (() => this.ntfySend({ title: 'Updaterr', message: I18N.t('notify.test.ntfy') })),
+    ]);
   }
 
   // --- Telegram: příjem kliknutí na tlačítka (long polling, nepotřebuje veřejnou URL) ---
@@ -211,7 +232,8 @@ class Notifier {
         const updates = await this.tg('getUpdates', { offset: this.tgOffset, timeout: 50, allowed_updates: ['callback_query'] });
         for (const u of updates) {
           this.tgOffset = u.update_id + 1;
-          if (u.callback_query) await this.onCallback(u.callback_query).catch((e) => this.ctx.store.log('warn', `Telegram: ${e.message}`));
+          // Bez čekání: stahování (ověření seedů) trvá i minuty a další kliknutí by mezitím Telegramu vypršela
+          if (u.callback_query) this.onCallback(u.callback_query).catch((e) => this.ctx.store.log('warn', `Telegram: ${e.message}`));
         }
       } catch (e) {
         this.ctx.store.log('warn', `Telegram polling: ${e.message}`);
@@ -236,7 +258,7 @@ class Notifier {
       if (!p) throw new Error(I18N.t('err.proposalGone'));
       if (action === 'g') {
         // Telegram čeká na odpověď max. pár sekund – potvrdíme hned, stahování (s ověřením seedů) poběží dál
-        await this.tg('answerCallbackQuery', { callback_query_id: cb.id, text: I18N.t('notify.cb.grabbing') });
+        await this.tg('answerCallbackQuery', { callback_query_id: cb.id, text: I18N.t('notify.cb.grabbing') }).catch(() => {});
         // Starší zprávy mají v tlačítku pořadí, novější ID kandidáta
         const idx = /^\d$/.test(ref) ? Number(ref) : resolveCandidate(p, ref);
         const d = await this.ctx.grab(pid, idx);

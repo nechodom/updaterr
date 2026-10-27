@@ -1,5 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert');
+require('../src/i18n').setLocale('cs'); // testy ověřují české texty
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');

@@ -44,8 +44,25 @@ function autoWatchNew(store, app, prevKeys, seen) {
   for (const key of seen) {
     if (prevKeys.has(key)) continue;
     const it = store.s.items[key];
-    if (!it || watchOf(store, it)) continue;
+    if (!it || it.missing || watchOf(store, it)) continue;
     if (app === 'sonarr' && knownSeries.has(String(it.arrId))) continue;
+    setWatch(store, it, { enabled: true, auto: mode === 'auto', origin: 'new' });
+    watched.push(it);
+  }
+  return watched;
+}
+
+// První stažení od Updaterru (firstgrab.js) je hotové – hlídání podle autoWatchNew jako u ostatních nových titulů.
+// Položka se do knihovny dostala dřív než soubor, takže ji autoWatchNew za novou nepovažuje. U seriálu jen nový
+// seriál: žádná jiná jeho série se soubory v knihovně (kromě právě stažených `items`).
+function watchFirst(store, items) {
+  const mode = store.settings.autoWatchNew;
+  if (!['auto', 'ask'].includes(mode)) return [];
+  const keys = new Set(items.map((it) => it.key));
+  const watched = [];
+  for (const it of items) {
+    if (watchOf(store, it)) continue;
+    if (it.app === 'sonarr' && Object.values(store.s.items).some((x) => x.app === 'sonarr' && x.arrId === it.arrId && !x.missing && !keys.has(x.key))) continue;
     setWatch(store, it, { enabled: true, auto: mode === 'auto', origin: 'new' });
     watched.push(it);
   }
@@ -91,6 +108,10 @@ function recheckMs(store, item) {
 function autoAllowed(store, item, cand) {
   const st = store.settings;
   if (!cand || cand.set) return false;
+  // Výměna za jinou verzi filmu kvůli dabingu (search.js cutMatchCandidates) – přijdeš o stávající střih
+  if (cand.kind === 'cutmatch') return false;
+  // Useknutý/poškozený soubor v knihovně (library.js truncationOf) – náhradu vždy jen po schválení
+  if (item?.current?.truncated) return false;
   const watched = watchOf(store, item)?.auto;
   // Novější formát videa stahuje sám jen hlídaná položka s automatickým upgradem, ne nastavení celé knihovny
   if (cand.kind === 'codec' && !watched) return false;
@@ -102,7 +123,11 @@ function autoAllowed(store, item, cand) {
   if (cand.seeders != null && cand.seeders < st.autoMinSeeders) return false;
   // Horší rozlišení kvůli jazyku jen po schválení – kromě slučování, kde video zůstává
   if (cand.kind !== 'merge' && require('./search').lowerRes(cand)) return false;
+  // Release, který by části epizod jazyk zhoršil (série s jednou epizodou v obou jazycích, balík jen v jednom), jen po schválení
+  if (cand.worsens) return false;
+  // Jiná verze filmu (Extended → kino verze) jen po schválení – u výměny přijdeš o střih, u sloučení nejspíš nesedí délka
+  if (cand.otherEdition || cand.otherCut) return false;
   return true;
 }
 
-module.exports = { watchOf, setWatch, autoWatchNew, wantOf, setWant, codecOf, setCodec, recheckMs, autoAllowed };
+module.exports = { watchOf, setWatch, autoWatchNew, watchFirst, wantOf, setWant, codecOf, setCodec, recheckMs, autoAllowed };

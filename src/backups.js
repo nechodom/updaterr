@@ -7,6 +7,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const I18N = require('./i18n');
+const { stagingFor } = require('./store');
 const A = require('./audio');
 const L = require('./lang');
 
@@ -14,6 +15,8 @@ const DAY = 86400e3;
 const BLOCKED_MIN_DAYS = 30; // nepovedený import: originál se může hodit déle
 const REVIEW_OFFSET_MS = 10_000; // takhle velký posun přidané stopy bývá jiný úvod nebo střih donoru
 const REVIEW_VERIFY_MS = 50;     // zbytkový posun ve výsledku (sloučení i oprava pustí až 80 ms)
+// Výsledek ke kontrole nebo ještě neověřený: záloha může být jediná dobrá kopie – drží se jako po nepovedeném importu
+const held = (b) => ['review', 'pending', 'running'].includes(b.check?.status);
 
 function walk(dir, rel = '') {
   const out = [];
@@ -32,7 +35,7 @@ function walk(dir, rel = '') {
 function expiryAt(b, days) {
   if (b.keep === 'forever' || b.keep === 'orphan') return null;
   if (b.keep === 'custom') return b.expiresAt;
-  if (b.state === 'done' && b.finishedAt) return b.finishedAt + days * DAY;
+  if (b.state === 'done' && b.finishedAt) return b.finishedAt + (held(b) ? Math.max(days, BLOCKED_MIN_DAYS) : days) * DAY;
   if (b.state === 'blocked' && b.finishedAt) return b.finishedAt + Math.max(days, BLOCKED_MIN_DAYS) * DAY;
   return b.expiresAt;
 }
@@ -40,7 +43,7 @@ function expiryAt(b, days) {
 // Co se při dané retenci smaže: [{ id, why: 'age' | 'verified' | 'size' }]. S deleteVerified jdou pryč
 // hned zálohy s ověřeným sloučením (ne ty s vlastním termínem). Limit velikosti počítá jen místo, které
 // zálohy opravdu zabírají (bez hardlinků sdílených s knihovnou), a maže od nejstarších – nikdy ty
-// s vlastním termínem, běžící úlohy ani zálohy po nepovedeném importu.
+// s vlastním termínem, běžící úlohy, zálohy po nepovedeném importu ani zálohy ke kontrole / neověřené.
 function plan(list, { days, maxBytes = 0, deleteVerified = false }, now = Date.now()) {
   const out = [];
   const left = [];
@@ -52,7 +55,7 @@ function plan(list, { days, maxBytes = 0, deleteVerified = false }, now = Date.n
   }
   let total = left.reduce((s, b) => s + b.exclusive, 0);
   if (maxBytes > 0 && total > maxBytes) {
-    const victims = left.filter((b) => b.keep === 'auto' && !b.active && b.state === 'done' && b.exclusive > 0)
+    const victims = left.filter((b) => b.keep === 'auto' && !b.active && b.state === 'done' && !held(b) && b.exclusive > 0)
       .sort((a, b) => a.createdAt - b.createdAt);
     for (const b of victims) {
       if (total <= maxBytes) break;
@@ -167,6 +170,10 @@ class Backups {
           size: files.reduce((s, f) => s + f.size, 0),
           exclusive: files.reduce((s, f) => s + (f.shared ? 0 : f.size), 0),
         });
+        // Zobrazený termín podle aktuální retence (backupUntil v úloze je z doby dokončení – např. bez ohledu
+        // na to, že záloha čeká na kontrolu a drží se déle)
+        const b = out[out.length - 1];
+        if (keep === 'auto' && !b.active) b.expiresAt = expiryAt(b, this.st.keepBackupDays) ?? b.expiresAt;
       }
     }
     return out.sort((a, b) => b.createdAt - a.createdAt);
@@ -299,6 +306,8 @@ class Backups {
     fs.rmSync(b.dir, { recursive: true, force: true });
     const j = this.job(id);
     if (j) j.backupRemoved = true;
+    // Opravené soubory zablokované opravy synchronizace (import neproběhl) jinak ve stagingu zůstanou navždy
+    if (j?.type === 'syncfix' && !j.active && j.dir && path.dirname(j.dir) === stagingFor(this.st, j.app)) fs.rmSync(j.dir, { recursive: true, force: true });
     this.ctx.store.save();
     this.ctx.store.log('info', I18N.t('backup.removed', { label: b.label, reason, freed: b.exclusive ? I18N.t('backup.freed', { gb: (b.exclusive / 1024 ** 3).toFixed(1) }) : '' }));
     return { removed: id };
@@ -313,13 +322,18 @@ class Backups {
       delete j.backupCustom;
       const b = this.list().find((x) => x.id === id);
       const exp = b && expiryAt({ ...b, keep: 'auto' }, this.st.keepBackupDays);
-      if (exp) j.backupUntil = exp;
+      // Mimo hotové/zablokované úlohy termín podle stavu neexistuje – vrátit ten před vlastním termínem
+      const auto = b && b.state !== 'done' && b.state !== 'blocked' ? j.backupUntilAuto : null;
+      if (auto || exp) j.backupUntil = auto || exp;
+      delete j.backupUntilAuto;
     } else if (forever) {
+      if (!j.backupCustom && !j.backupKeep) j.backupUntilAuto = j.backupUntil;
       j.backupKeep = 'forever';
       delete j.backupCustom;
     } else {
       const n = Number(days);
       if (!Number.isFinite(n) || n <= 0) throw new Error(I18N.t('backup.err.days'));
+      if (!j.backupCustom && !j.backupKeep) j.backupUntilAuto = j.backupUntil;
       delete j.backupKeep;
       j.backupCustom = true;
       j.backupUntil = Date.now() + n * DAY;

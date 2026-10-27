@@ -136,8 +136,9 @@ const S = {
   draft: {},
   last: {},              // poslední vykreslená data (bez zbytečného překreslování)
   propFilter: lsGet('propFilter', 'all'),
-  lib: { q: '', app: lsGet('lib.app', ''), tier: '', status: '', watched: false, desync: false, sort: lsGet('lib.sort', { key: 'tier', dir: 1 }), limit: 200 },
+  lib: { q: '', app: lsGet('lib.app', ''), tier: '', status: '', watched: false, desync: false, unverified: false, sort: lsGet('lib.sort', { key: 'tier', dir: 1 }), limit: 200 },
   backups: null,
+  grabbing: {},          // návrh → guid kandidáta, jehož schválení z tohohle okna ještě běží
   bkDraft: {},           // rozepsaná retence záloh (nepřepisovat při obnovení)
   logLevel: 'all',
   logQ: '',
@@ -151,8 +152,15 @@ const TABS = ['proposals', 'library', 'activity', 'backups', 'log', 'settings'];
 function route() {
   const h = location.hash.replace(/^#\/?/, '');
   const m = h.match(/^p=(\w+)/);
-  if (m) { S.highlight = m[1]; showTab('proposals', false); return; }
+  if (m) { openProposal(m[1], false); return; }
   showTab(TABS.includes(h) ? h : 'proposals', false);
+}
+// Otevřít konkrétní návrh: filtr typu ho nesmí schovat
+function openProposal(id, push = true) {
+  S.highlight = id;
+  S.propFilter = 'all';
+  lsSet('propFilter', 'all');
+  showTab('proposals', push);
 }
 function showTab(tab, push = true) {
   if (S.tab === 'settings' && tab !== 'settings' && Object.keys(S.draft).length) toast(t('toast.unsavedSettings'));
@@ -181,7 +189,15 @@ applyThemeIcon();
 function renderPulse() {
   const ov = S.ov;
   if (!ov) return;
-  const cnt = (id, n) => { const el = $(id); el.hidden = !n; el.textContent = n; };
+  // Pod 1100 px mají záložky jen ikonu – počet patří i do jména tlačítka (aria-label)
+  const cnt = (id, n) => {
+    const el = $(id);
+    el.hidden = !n;
+    el.textContent = n;
+    const b = el.closest('button');
+    const name = b.querySelector('span')?.textContent || '';
+    b.setAttribute('aria-label', n ? `${name} (${n})` : name);
+  };
   cnt('#count-proposals', ov.pending);
   cnt('#count-activity', ov.downloading);
   let dot = 'ok';
@@ -206,29 +222,43 @@ function renderPulse() {
 // Návrhy
 // ===================================================================================
 function kindBadge(c) {
-  if (c.kind === 'merge') return `<span class="chip accent">${icon('merge')}${t('kind.merge', { lang: langLabel(c.mergeLang) })}</span>`;
-  if (c.set) return `<span class="chip">${icon('layers')}${t('kind.set', { count: c.parts?.length || 1 })}</span>`;
+  const setChip = c.set ? `<span class="chip">${icon('layers')}${t('kind.set', { count: c.parts?.length || 1 })}</span>` : '';
+  if (c.kind === 'merge') return `<span class="chip accent">${icon('merge')}${t('kind.merge', { lang: langLabel(c.mergeLang) })}</span>${setChip}`;
+  if (c.set) return setChip;
   if (c.seasons?.length > 1) return `<span class="chip">${icon('layers')}${t('kind.pack', { from: c.seasons[0], to: c.seasons[c.seasons.length - 1] })}</span>`;
   if (c.kind === 'codec') return `<span class="chip">${icon('zap')}${t('kind.codec')}</span>`;
+  if (c.kind === 'cutmatch') return `<span class="chip accent" title="${esc(t('kind.cutmatchTitle', { lang: langLabel(c.donor?.mergeLang) }))}">${icon('merge')}${t('kind.cutmatch', { lang: langLabel(c.donor?.mergeLang) })}</span>`;
+  if (c.kind === 'repair') return `<span class="chip warn">${icon('alert')}${t('kind.repair')}</span>`;
   return c.kind === 'quality' ? `<span class="chip">${icon('up')}${t('kind.quality')}</span>` : `<span class="chip">${icon('sparkles')}${t('kind.language')}</span>`;
 }
+
+// Useknutý/poškozený soubor filmu (library.js truncationOf): soubor výrazně kratší než film
+const truncText = (x) => t('trunc.text', { file: x.fileMin, runtime: x.runtimeMin });
+const truncTitle = () => t('trunc.title');
 
 function poster(url, cls = 'poster') {
   const ph = `<div class="${cls} ph">${icon('film', 'lg')}</div>`;
   return url ? `<img class="${cls}" loading="lazy" src="${esc(url)}" alt="" onerror="this.outerHTML=this.dataset.ph" data-ph="${esc(ph)}">` : ph;
 }
 
+// Guid kandidáta, který se právě schvaluje – ze serveru (i když schválení přišlo z Telegramu/ntfy), nebo z tohohle okna
+const approvingGuid = (p) => p.approving || S.grabbing[p.id] || null;
+
 function optionRow(p, c, i, pending) {
-  const chosen = p.status === 'grabbed' && (p.grabbedGuid ? p.grabbedGuid === c.guid : p.grabbedIdx === i);
-  const title = c.infoUrl ? `<a href="${esc(c.infoUrl)}" target="_blank" rel="noreferrer noopener">${esc(c.title)}</a>` : esc(c.title);
-  const notes = (c.notes || []).map((n) => `<span class="note">${esc(n)}</span>`).join('');
+  const chosen = p.status === 'grabbed' && (p.grabbedGuid ? p.grabbedGuid === c.guid && (!p.grabbedKind || p.grabbedKind === c.kind) : p.grabbedIdx === i);
+  const title = /^https?:\/\//i.test(c.infoUrl || '') ? `<a href="${esc(c.infoUrl)}" target="_blank" rel="noreferrer noopener">${esc(c.title)}</a>` : esc(c.title);
+  const notes = (c.notes || []).map((n) => `<span class="note">${esc(n)}</span>`).join('') +
+    (c.badDonorId && pending ? `<button class="btn ghost sm o-retry" data-act="retrymerge" data-id="${esc(c.badDonorId)}" title="${esc(t('option.retryMergeTitle'))}">${icon('merge')}<span>${t('option.retryMerge')}</span></button>` : '');
   const warns = (c.warnings || []).map((w) => `<span class="warn-text">${icon('alert')}${esc(w)}</span>`).join('');
   const merge = c.kind === 'merge';
   // U sady se seedy berou z nejslabšího torrentu, velikost se sčítá
   const multiPart = c.set && c.parts?.length > 1;
+  // Návrh se právě schvaluje (ověření může trvat i minuty) – po překreslení nenabízet znovu „Stáhnout“
+  const approving = approvingGuid(p);
+  const off = approving ? ' disabled' : '';
   const action = pending
-    ? `<button class="btn ${merge ? 'success' : 'primary'}" data-act="grab" data-p="${p.id}" data-c="${esc(c.cid)}">${icon(merge ? 'merge' : 'download')}<span>${merge ? t('option.addAudio') : t('common.download')}</span></button>
-       <button class="icon-btn sm" data-act="skip" data-p="${p.id}" data-guid="${esc(c.guid)}" title="${t('option.skipTitle')}" aria-label="${t('option.skip')}">${icon('x')}</button>`
+    ? `<button class="btn ${merge ? 'success' : 'primary'}" data-act="grab" data-p="${p.id}" data-c="${esc(c.cid)}"${off}>${approving === c.guid ? `${icon('refresh', 'spin')}<span>${t('common.verifying')}</span>` : `${icon(merge ? 'merge' : 'download')}<span>${merge ? t('option.addAudio') : t('common.download')}</span>`}</button>
+       <button class="icon-btn sm" data-act="skip" data-p="${p.id}" data-guid="${esc(c.guid)}" title="${t('option.skipTitle')}" aria-label="${t('option.skip')}"${off}>${icon('x')}</button>`
     : chosen ? `<span class="chip ok">${icon('check')}${t('option.chosen')}</span>` : '';
   return `<div class="option ${i === 0 && pending ? 'best' : ''} ${chosen ? 'chosen' : ''}">
     <div>
@@ -239,7 +269,7 @@ function optionRow(p, c, i, pending) {
     <div class="o-right">
       <div class="o-metrics">
         <div class="m"><span class="seeds ${seedClass(c.seeders)}">${c.seeders ?? '–'}</span><small>${multiPart ? t('option.minSeeds') : t('option.seeds')}</small></div>
-        <div class="m"><span class="num">${gb(c.size)}</span><small>${merge ? t('option.toDownload') : multiPart ? t('option.total') : t('option.size')}</small></div>
+        <div class="m"><span class="num">${gb(c.size)}</span><small>${merge ? t('option.toDownload') : multiPart || c.kind === 'cutmatch' ? t('option.total') : t('option.size')}</small></div>
         <div class="m"><span>${esc(c.indexer)}</span><small>${c.ageDays != null ? t(multiPart ? 'option.oldest' : 'option.age', { n: c.ageDays }) : ''}</small></div>
       </div>
       <div class="o-actions">${action}</div>
@@ -282,6 +312,7 @@ function proposalCard(p) {
   const best = p.candidates?.[0] || {};
   const afterQuality = best.kind === 'merge' ? cur.quality : best.quality;
   const status = { grabbed: ['ok', 'check', t('proposals.status.grabbed')], rejected: ['', 'ban', t('proposals.status.rejected')], expired: ['warn', 'clock', t('proposals.status.expired')] }[p.status];
+  const off = approvingGuid(p) ? ' disabled' : '';
   return `<article class="card proposal ${pending ? '' : 'settled'} ${S.highlight === p.id ? 'flash' : ''}" id="p-${p.id}">
     ${poster(it.poster)}
     <div>
@@ -302,6 +333,7 @@ function proposalCard(p) {
       </div>
       <div class="compare">
         <div class="side"><span class="lbl">${t('proposals.now')}</span>${currentChips(cur, it)}<span class="chip">${esc(cur.quality)}</span>${it.codec ? codecChip(cur.vcodecName) : ''}
+          ${cur.truncated ? `<span class="chip warn" title="${esc(truncTitle())}">${icon('alert')}${esc(truncText(cur.truncated))}</span>` : ''}
           ${cur.audioSource === 'nazev' ? `<span class="chip warn" title="${t('proposals.nameGuessTitle')}">${t('common.guess')}</span>` : ''}
           ${cur.audioSource === 'poslech' ? `<span class="chip ok" title="${esc(t('proposals.speechTitle', { tag: cur.tagAudio || '?', audio: cur.audio }))}">${icon('check')}${t('common.verifiedBySpeech')}</span>` : ''}</div>
         ${best.tier != null ? `${icon('arrow')}<div class="side"><span class="lbl">${t('proposals.best')}</span>${it.want?.length && meetsWant(best.tier, it.want, it.originalLanguage) ? wantChip(it.want, t('proposals.releaseHas', { tier: TIER[best.tier] })) : tierChip(best.tier)}<span class="chip">${esc(afterQuality)}</span>${it.codec ? codecChip(best.kind === 'merge' ? cur.vcodecName : best.vcodecName, best.kind !== 'merge' && best.vcodec >= CODEC_RANK[it.codec]) : ''}
@@ -309,9 +341,9 @@ function proposalCard(p) {
       </div>
       <div class="options">${(p.candidates || []).map((c, i) => optionRow(p, c, i, pending)).join('')}</div>
       ${pending ? `<div class="p-foot">
-        <button class="btn ghost sm" data-act="recheck" data-key="${esc(p.itemKey)}">${icon('refresh')}${t('proposals.searchAgain')}</button>
-        <button class="btn ghost sm" data-act="reject" data-p="${p.id}" data-days="30">${icon('pause')}${t('proposals.snooze')}</button>
-        <button class="btn ghost sm danger" data-act="reject" data-p="${p.id}" data-days="3650">${icon('ban')}${t('proposals.reject')}</button>
+        <button class="btn ghost sm" data-act="recheck" data-key="${esc(p.itemKey)}"${off}>${icon('refresh')}${t('proposals.searchAgain')}</button>
+        <button class="btn ghost sm" data-act="reject" data-p="${p.id}" data-days="30"${off}>${icon('pause')}${t('proposals.snooze')}</button>
+        <button class="btn ghost sm danger" data-act="reject" data-p="${p.id}" data-days="3650"${off}>${icon('ban')}${t('proposals.reject')}</button>
         <span class="spacer"></span>
         ${it.key ? `<button class="btn ghost sm" data-act="open" data-key="${esc(it.key)}">${t('proposals.detail')}${icon('chevron')}</button>` : ''}
       </div>` : ''}
@@ -326,9 +358,10 @@ function renderProposals() {
   const kinds = {
     all: () => true,
     language: (p) => p.candidates?.some((c) => c.kind === 'language'),
-    merge: (p) => p.candidates?.some((c) => c.kind === 'merge'),
+    merge: (p) => p.candidates?.some((c) => c.kind === 'merge' || c.kind === 'cutmatch'),
     quality: (p) => p.candidates?.some((c) => c.kind === 'quality'),
     codec: (p) => p.candidates?.some((c) => c.kind === 'codec'),
+    repair: (p) => p.candidates?.some((c) => c.kind === 'repair'),
   };
   if (!kinds[S.propFilter]) S.propFilter = 'all';
   const shown = pending.filter(kinds[S.propFilter]);
@@ -369,7 +402,7 @@ function renderProposals() {
         <p>${ov.setupNeeded ? t('proposals.leadSetup') : t('proposals.lead', { order: `<b>${esc(TIER[3])}</b> › <b>${esc(LANG.P)}</b> › <b>${esc(LANG.S)}</b>` })}</p>
       </div>
       ${pending.length ? `<div class="segmented" role="group" aria-label="${t('proposals.filterLabel')}">
-        ${[['all', t('common.all'), pending.length], ['language', t('common.language'), n('language')], ['merge', t('proposals.filter.merge'), n('merge')], ['quality', t('common.quality'), n('quality')], ['codec', t('proposals.filter.codec'), n('codec')]]
+        ${[['all', t('common.all'), pending.length], ['language', t('common.language'), n('language')], ['merge', t('proposals.filter.merge'), n('merge')], ['quality', t('common.quality'), n('quality')], ['codec', t('proposals.filter.codec'), n('codec')], ['repair', t('proposals.filter.repair'), n('repair')]]
           .filter(([k, , c]) => k === 'all' || c)
           .map(([k, l, c]) => `<button data-act="pfilter" data-f="${k}" aria-pressed="${S.propFilter === k}">${l} <span class="muted">${c}</span></button>`).join('')}
       </div>` : ''}
@@ -404,16 +437,17 @@ const syncFixable = (i) => i.sync?.warn && !i.downloadId;
 
 function libFiltered() {
   const L = S.lib;
-  const q = L.q.trim().toLowerCase();
+  const q = fold(L.q.trim());
   const list = S.items.filter((i) =>
     (!L.app || i.app === L.app) &&
     (L.tier === '' || String(i.current.tier) === L.tier) &&
     (!L.status || i.status === L.status) &&
     (!L.watched || i.watch) &&
     (!L.desync || i.sync?.warn) &&
-    (!q || i.label.toLowerCase().includes(q)));
+    (!L.unverified || !heard(i)) &&
+    (!q || fold(i.label).includes(q)));
   const key = {
-    label: (i) => i.label.toLowerCase(),
+    label: (i) => i.label,
     tier: (i) => i.current.tier,
     quality: (i) => i.current.qrank ?? 0,
     status: (i) => i.status,
@@ -421,7 +455,7 @@ function libFiltered() {
   }[L.sort.key] || ((i) => i.label);
   return list.sort((a, b) => {
     const x = key(a), y = key(b);
-    return (x > y ? 1 : x < y ? -1 : a.label.localeCompare(b.label, I18N.locale)) * L.sort.dir;
+    return (compareValues(x, y) || textCompare(a.label, b.label)) * L.sort.dir;
   });
 }
 
@@ -447,9 +481,9 @@ function libRow(i) {
     : i.lastSearchedAt ? `<span title="${esc(fullDate(i.lastSearchedAt))}">${ago(i.lastSearchedAt)}</span>` : '<span class="muted">–</span>';
   return `<tr data-key="${esc(i.key)}" tabindex="0">
     <td class="hide-m">${i.poster ? `<img class="thumb" loading="lazy" src="${esc(i.poster)}" alt="" onerror="this.style.visibility='hidden'">` : '<div class="thumb"></div>'}</td>
-    <td class="t-name">${esc(i.label)}${i.originalLanguage && i.originalLanguage !== LANG.secName ? `<small>${t('common.original', { lang: esc(i.originalLanguage) })}</small>` : ''}${i.want ? `<small>${wantText(i.want)}</small>` : ''}${i.codec ? `<small>${codecText(i.codec)}</small>` : ''}${i.sync?.warn ? `<small class="sync-warn" title="${esc(t('library.syncTip', { ...LP, lag: syncLagSentence(i.sync.offsetMs).toLowerCase() }))}">${icon('alert')}${esc(syncWarnText(i.sync))}</small>` : ''}<small class="show-m"><span class="status s-${i.status}">${STATUS[i.status] || i.status}</span></small></td>
+    <td class="t-name">${esc(i.label)}${i.originalLanguage && i.originalLanguage !== LANG.secName ? `<small>${t('common.original', { lang: esc(i.originalLanguage) })}</small>` : ''}${i.want ? `<small>${wantText(i.want)}</small>` : ''}${i.codec ? `<small>${codecText(i.codec)}</small>` : ''}${i.current.truncated ? `<small class="sync-warn" title="${esc(truncTitle())}">${icon('alert')}${esc(truncText(i.current.truncated))}</small>` : ''}${i.sync?.warn ? `<small class="sync-warn" title="${esc(t('library.syncTip', { ...LP, lag: syncLagSentence(i.sync.offsetMs).toLowerCase() }))}">${icon('alert')}${esc(syncWarnText(i.sync))}</small>` : ''}<small class="show-m"><span class="status s-${i.status}">${STATUS[i.status] || i.status}</span></small></td>
     <td>${tierChip(i.current.tier, i.originalLanguage)}${epsBar(i.current.tierCounts)}</td>
-    <td class="hide-m"><div class="audio" title="${esc(i.current.audio)}">${esc(i.current.audio)}${i.current.audioSource === 'nazev' ? ` <span class="chip warn">${t('common.guess')}</span>` : ''}${i.current.audioSource === 'poslech' ? ` <span class="chip ok" title="${esc(t('library.tagTip', { tag: i.current.tagAudio || '?' }))}">${t('library.bySpeech')}</span>` : ''}</div></td>
+    <td class="hide-m"><div class="audio" title="${esc(i.current.audio)}">${esc(i.current.audio)}${i.current.audioSource === 'nazev' ? ` <span class="chip warn">${t('common.guess')}</span>` : ''}${i.current.audioSource === 'poslech' ? ` <span class="chip ok" title="${esc(t('library.tagTip', { tag: i.current.tagAudio || '?' }))}">${t('library.bySpeech')}</span>` : heard(i) ? ` <span class="heard" title="${esc(t('library.heardTip'))}">${icon('headphones')}</span>` : ''}</div></td>
     <td class="hide-m nowrap">${esc(i.current.quality)}${i.current.vcodecName && i.current.vcodecName !== '?' ? `<small class="muted">${esc(i.current.vcodecName)}</small>` : ''}</td>
     <td class="hide-m"><span class="status s-${i.status}">${STATUS[i.status] || i.status}</span></td>
     <td class="hide-m nowrap small">${checked}</td>
@@ -458,6 +492,97 @@ function libRow(i) {
       <button class="icon-btn sm" data-act="recheck" data-key="${esc(i.key)}" title="${t('common.searchNow')}" aria-label="${t('common.searchNow')}">${icon('search')}</button>
     </div></td>
   </tr>`;
+}
+
+// --- Hromadná kontrola a poslech ----------------------------------------------------
+// Ověřeno poslechem (pro aktuální soubory)
+const heard = (i) => Boolean(i.langCheck && !i.langCheck.error);
+
+// Odhad délky poslechu: průměr z už ověřených položek (film ~1 soubor, série 3 epizody)
+function listenSec(items) {
+  const avg = (app, dflt) => {
+    const ms = S.items.filter((i) => i.app === app && heard(i) && i.langCheck.ms).map((i) => i.langCheck.ms);
+    return ms.length ? ms.reduce((a, b) => a + b, 0) / ms.length / 1000 : dflt;
+  };
+  const per = { radarr: avg('radarr', 25), sonarr: avg('sonarr', 75) };
+  return items.reduce((a, i) => a + (per[i.app] || 30), 0);
+}
+
+function duration(sec) {
+  if (sec < 90) return t('duration.fewMinutes');
+  if (sec < 3600) return t('count.minutes', { count: Math.round(sec / 60) });
+  const h = sec / 3600;
+  return h < 10 ? `${(Math.round(h * 2) / 2).toLocaleString(I18N.locale)} h` : t('count.hours', { count: Math.round(h) });
+}
+
+// Pruh v Knihovně: kolik je ověřeno poslechem a průběh hromadného poslechu
+function renderListen(scope) {
+  const el = $('#lib-listen');
+  if (!el) return;
+  const q = S.ov?.langQueue || {};
+  if (!S.ov?.speech) { el.hidden = true; return; }
+  const done = scope.filter(heard).length;
+  const total = scope.length || 1;
+  const running = q.queued > 0;
+  const left = running && S.items.length ? (listenSec(S.items) / S.items.length) * q.queued : 0;
+  el.hidden = false;
+  el.classList.toggle('on', running);
+  el.innerHTML = `
+    <span class="listen-ic">${icon('headphones', running ? 'pulse-ic' : '')}</span>
+    <div class="listen-main">
+      ${running
+        ? `<div class="listen-line"><b>${t('listen.running', { n: q.done + (q.current ? 1 : 0), total: q.total })}</b><span class="muted"> · ${q.current ? esc(q.current) : t('listen.continuing')}</span></div>
+           <small>${t('listen.left', { dur: duration(left) })}${q.corrected ? ` · <span class="warn-text">${t('listen.corrected', { n: q.corrected })}</span>` : ''}${q.failed ? ` · ${t('listen.failed', { n: q.failed })}` : ''}</small>`
+        : `<div class="listen-line"><b>${t('listen.verified', { n: done, total: scope.length })}</b></div>
+           <small>${done === scope.length ? t('listen.allOk') : t('listen.restByTags')}</small>`}
+      <span class="listen-bar"><i style="width:${((running ? q.done / (q.total || 1) : done / total) * 100).toFixed(1)}%"></i></span>
+    </div>
+    ${running
+      ? `<button class="btn sm ghost" data-act="listencancel">${t('listen.stop')}</button>`
+      : done < scope.length ? `<button class="btn sm ghost" data-act="lunverified" aria-pressed="${S.lib.unverified}">${S.lib.unverified ? t('listen.showAll') : t('listen.showUnverified')}</button>` : ''}`;
+}
+
+// Dialog hromadné kontroly – vrací zvolenou akci, nebo null
+function bulkDialog() {
+  const dlg = $('#bulk');
+  const scope = S.items.filter((i) => !S.lib.app || i.app === S.lib.app);
+  const where = t({ radarr: 'bulk.scope.movies', sonarr: 'bulk.scope.series' }[S.lib.app] || 'bulk.scope.all');
+  const sec = S.settings?.settings?.searchIntervalSec || 90;
+  const q = S.ov?.langQueue || {};
+  const model = S.settings?.settings?.speechModel;
+  const unheard = scope.filter((i) => !heard(i));
+  const opts = [];
+  if (S.ov?.speech) {
+    opts.push({ group: t('bulk.group.listen') },
+      { v: 'listen', n: unheard.length, t: t('bulk.listen.title'), d: t('bulk.listen.text'),
+        time: listenSec(unheard), badge: unheard.length ? t('bulk.recommended') : '' },
+      { v: 'listen-all', n: scope.length, t: t('bulk.listenAll.title'),
+        d: t(model ? 'bulk.listenAll.textModel' : 'bulk.listenAll.text', { model }), time: listenSec(scope) });
+  }
+  opts.push({ group: t('bulk.group.search') });
+  for (const tier of [1, 2]) {
+    const n = scope.filter((i) => i.current.tier <= tier).length;
+    opts.push({ v: `search-${tier}`, n, t: t(tier === 1 ? 'bulk.search1.title' : 'bulk.search2.title', LP),
+      d: t(tier === 1 ? 'bulk.search1.text' : 'bulk.search2.text', LP), time: n * sec });
+  }
+  const first = opts.find((o) => o.v && o.n);
+  $('#bulk-body').innerHTML = `
+    <p>${t('bulk.intro', { where, items: t('count.items', { count: scope.length }) })}</p>
+    ${q.queued ? `<p class="note">${icon('headphones')} ${t('bulk.alreadyRunning', { n: q.queued, total: q.total })}</p>` : ''}
+    <div class="bulk-opts" role="radiogroup">
+      ${opts.map((o) => (o.group ? `<div class="bulk-group">${esc(o.group)}</div>` : `
+        <label class="bulk-opt ${o.n ? '' : 'off'}">
+          <input type="radio" name="bulk" value="${o.v}" ${o === first ? 'checked' : ''} ${o.n ? '' : 'disabled'}>
+          <span class="bulk-txt"><b>${esc(o.t)}${o.badge ? ` <span class="chip ok">${o.badge}</span>` : ''}</b><small>${esc(o.d)}</small></span>
+          <span class="bulk-n"><b>${o.n}</b><small>${o.n ? `~${duration(o.time)}` : t('bulk.nothing')}</small></span>
+        </label>`)).join('')}
+    </div>`;
+  $('#bulk-ok').disabled = !first;
+  dlg.returnValue = '';
+  dlg.showModal();
+  return new Promise((resolve) => dlg.addEventListener('close', () => {
+    resolve(dlg.returnValue === 'ok' ? dlg.querySelector('input[name="bulk"]:checked')?.value || null : null);
+  }, { once: true }));
 }
 
 function renderLibrary(full = true) {
@@ -485,13 +610,13 @@ function renderLibrary(full = true) {
           <p>${t('library.lead', { movies: t('count.movies', { count: movies }), seasons: t('library.countSeasons', { count: seasons }) })}</p>
         </div>
         <div class="toolbar">
-          <button class="btn" data-act="bulk" data-tier="1" title="${t('library.bulkPTitle', LP)}">${icon('search')}${t('library.bulkP', LP)}</button>
-          <button class="btn ghost" data-act="bulk" data-tier="2">${t('library.bulkPS', LP)}</button>
+          <button class="btn" data-act="bulk" title="${t('library.bulkTitle')}">${icon('layers')}${t('library.bulk')}</button>
           <button class="icon-btn" data-act="sync" title="${t('library.syncTitle')}" aria-label="${t('library.syncLabel')}">${icon('refresh')}</button>
         </div>
       </div>
       <div class="stats" id="lib-stats"></div>
       <div class="dist" id="lib-dist"></div>
+      <div class="listen" id="lib-listen" hidden></div>
       <div class="toolbar" style="margin-bottom:12px">
         <label class="search"><span class="sr-only">${t('common.search')}</span>${icon('search')}<input class="input" id="lib-q" type="search" placeholder="${t('library.searchPlaceholder')}" value="${esc(L.q)}"></label>
         <div class="segmented" role="group" aria-label="${t('library.typeLabel')}">
@@ -534,6 +659,7 @@ function renderLibrary(full = true) {
     th.innerHTML = th.textContent.replace(/[↑↓]/g, '').trim() + (L.sort.key === th.dataset.sort ? ` <span class="arrow">${L.sort.dir > 0 ? '↑' : '↓'}</span>` : '');
     th.setAttribute('aria-sort', L.sort.key === th.dataset.sort ? (L.sort.dir > 0 ? 'ascending' : 'descending') : 'none');
   });
+  renderListen(scope);
   $('#lib-count').textContent = t('library.count', { n: list.length, total: S.items.length });
   const fixable = L.desync ? list.filter(syncFixable) : [];
   $('#lib-fixall').innerHTML = fixable.length ? `<button class="btn primary" data-act="syncfixall" title="${t('library.fixAllTitle')}">${icon('zap')}${t('library.fixAll', { n: fixable.length })}</button>` : '';
@@ -573,6 +699,17 @@ function langCheckHtml(it) {
     <div style="margin-top:10px">${btn}</div></div>`;
 }
 
+// Donory, se kterými sloučení zvuku neprošlo – znovu se nestahují (ani pod jiným indexerem / magnetem)
+function badDonorsHtml(it) {
+  if (!it.badDonors?.length) return '';
+  return `<div class="d-sec"><h4>${t('badDonors.title')}</h4>
+    <p class="note" style="margin:0 0 8px">${t('badDonors.text')}</p>
+    <ul class="results bad-donors">${it.badDonors.map((b) => `<li class="bad">${icon('ban')}<div>
+      <span class="mono">${esc(b.title)}</span>
+      <small class="muted">${esc(b.reason || '')} · <span title="${esc(fullDate(b.at))}">${ago(b.at)}</span>${b.times > 1 ? ` · ${t('badDonors.times', { n: b.times })}` : ''}</small></div>
+      <button class="btn ghost sm" data-act="unbaddonor" data-id="${esc(b.id)}" title="${esc(t('badDonors.unblockTitle'))}">${t('badDonors.unblock')}</button></li>`).join('')}</ul></div>`;
+}
+
 function renderDrawer() {
   const d = $('#drawer');
   const it = S.items.find((x) => x.key === S.drawer);
@@ -601,6 +738,7 @@ function renderDrawer() {
           <dt>${t('common.audioTracks')}</dt><dd class="mono">${esc(c.audio)}</dd>
           <dt>${t('common.quality')}</dt><dd>${esc(c.quality)}</dd>
           <dt>${t('codec.title')}</dt><dd>${c.vcodecName && c.vcodecName !== '?' ? esc(c.vcodecName) : `<span class="muted">${t('drawer.vcodecUnknown')}</span>`}</dd>
+          ${c.truncated ? `<dt>${t('drawer.length')}</dt><dd><span class="chip warn" title="${esc(truncTitle())}">${icon('alert')}${t('drawer.truncated')}</span> ${esc(t('drawer.truncatedText', { file: c.truncated.fileMin, runtime: c.truncated.runtimeMin }))}</dd>` : ''}
           <dt>${t('drawer.size')}</dt><dd>${gb(c.size)}${c.files > 1 ? ` · ${t('count.files', { count: c.files })}` : ''}</dd>
           ${c.tierCounts ? `<dt>${t('drawer.episodes')}</dt><dd>${[3, 2, 1, 0].filter((x) => c.tierCounts[x]).map((x) => `${TIER[x]}: ${c.tierCounts[x]}`).join(' · ')}${epsBar(c.tierCounts)}</dd>` : ''}
         </dl>
@@ -630,6 +768,7 @@ function renderDrawer() {
         <p class="muted small" style="margin:8px 0 0">${esc(CODEC_OPTS.find(([v]) => v === (it.codec || ''))[2])}.${it.codec ? ` ${t('codec.note')}` : ''}${it.codec && it.app === 'sonarr' ? ` ${t('codec.series')}` : ''}</p>
       </div>
       ${langCheckHtml(it)}
+      ${badDonorsHtml(it)}
       <div class="d-sec">
         <h4>${t('drawer.lastCheck')}</h4>
         ${it.lastSearchedAt ? `<p style="margin:0 0 8px">${ago(it.lastSearchedAt)} <span class="muted small">(${esc(fullDate(it.lastSearchedAt))})</span>${lr?.found != null ? ` – ${lr.found ? `<b>${t('count.suitable', { count: lr.found })}</b>` : t('drawer.nothingBetter')}` : ''}</p>` : `<p class="muted" style="margin:0">${t('drawer.notChecked')}</p>`}
@@ -793,12 +932,14 @@ function jobSide(j) {
   }
   if (j.state !== 'done' || j.type === 'syncfix') return '<span class="j-side"></span>';
   const to = j.result?.tier ?? j.candidate?.tier;
+  if (j.first) return `<span class="j-side">${tierChip(to)}</span>`;
   return `<span class="j-side">${tierChip(j.prev?.tier)}${icon('arrow')}${tierChip(to)}</span>`;
 }
 
 function jobRow({ id, j, tries }, { clock = false } = {}) {
   const open = S.act.open.has(id);
-  const typeChip = j.type === 'syncfix' ? `<span class="chip xs warn">${t('activity.type.syncfixShort')}</span>` : j.type === 'merge' ? `<span class="chip xs accent">${t('activity.type.mergeShort')}</span>` : '';
+  const typeChip = j.type === 'syncfix' ? `<span class="chip xs warn">${t('activity.type.syncfixShort')}</span>` : j.type === 'merge' ? `<span class="chip xs accent">${t('activity.type.mergeShort')}</span>`
+    : j.first ? `<span class="chip xs accent" title="${esc(t('activity.type.firstTitle'))}">${t('activity.type.first')}</span>` : '';
   const cancellable = j.active && !['processing', 'importing'].includes(j.state);
   const tm = j.active ? j.grabbedAt : jobEnd(j);
   return `<div class="jitem ${open ? 'open' : ''}">
@@ -806,7 +947,7 @@ function jobRow({ id, j, tries }, { clock = false } = {}) {
       <button class="j-btn" data-act="jtoggle" data-id="${esc(id)}" aria-expanded="${open}">
         ${jobBadge(j)}
         <span class="j-main">
-          <span class="j-title"><b>${esc(j.label)}</b>${typeChip}${j.auto ? `<span class="chip xs">${t('activity.autoShort')}</span>` : ''}${tries.length ? `<span class="chip xs" title="${t('activity.retriedTitle')}">${t('activity.attemptNth', { n: tries.length + 1 })}</span>` : ''}</span>
+          <span class="j-title"><b>${esc(j.label)}</b>${typeChip}${j.auto && !j.first ? `<span class="chip xs">${t('activity.autoShort')}</span>` : ''}${tries.length ? `<span class="chip xs" title="${t('activity.retriedTitle')}">${t('activity.attemptNth', { n: tries.length + 1 })}</span>` : ''}</span>
           ${jobSub(j)}
         </span>
         ${jobSide(j)}
@@ -848,7 +989,7 @@ function jobDetail(j, tries) {
       <span title="${esc(fullDate(j.grabbedAt))}">${t('activity.started', { ago: ago(j.grabbedAt) })}</span>
     </div>` : `<div class="job-meta">
       ${kind}
-      <span>${tierChip(j.prev?.tier)} ${esc(j.prev?.quality || '')}</span>${icon('arrow')}<span>${result} ${esc(j.result?.quality || (merge ? j.prev?.quality : c.quality) || '')}</span>
+      ${j.first ? `<span>${t('activity.noFileYet')}</span>` : `<span>${tierChip(j.prev?.tier)} ${esc(j.prev?.quality || '')}</span>`}${icon('arrow')}<span>${result} ${esc(j.result?.quality || (merge ? j.prev?.quality : c.quality) || '')}</span>
       ${c.indexer ? `<span>${esc(c.indexer)}</span>` : ''}
       ${c.seeders != null ? `<span class="seeds ${seedClass(c.seeders)}">${c.seeders} ${t('option.seeds')}</span>` : ''}
       <span>${gb(j.size || c.size)}</span>
@@ -856,6 +997,8 @@ function jobDetail(j, tries) {
       ${!j.active && j.finishedAt ? `<span title="${esc(fullDate(j.finishedAt))}">${t('activity.finished', { ago: ago(j.finishedAt) })}</span>` : ''}
     </div>`}
     ${j.message ? `<div class="job-msg">${esc(j.message)}</div>` : ''}
+    ${j.offerPending ? `<div style="margin-top:8px"><a class="btn sm" href="#p=${esc(j.offerProposalId)}">${icon('inbox')}${t('activity.openOffer')}</a></div>` : ''}
+    ${j.cancelledForeign?.length ? `<div class="note" style="margin-top:6px">${t('activity.cancelledForeign', { app: j.app === 'sonarr' ? 'Sonarr' : 'Radarr' })} <span class="mono">${j.cancelledForeign.map(esc).join(', ')}</span></div>` : ''}
     ${j.warning ? `<div class="warn-text" style="margin-top:6px">${icon('alert')}${esc(j.warning)}</div>` : ''}
     ${results ? `<ul class="results">${results}</ul>` : ''}
     ${parts}
@@ -1065,7 +1208,9 @@ async function loadBackups(force = false) {
 async function saveRetention(btn) {
   const o = S.backups;
   const body = { keepBackupDays: Number(S.bkDraft.days ?? o.keepBackupDays), maxBackupGB: Number(S.bkDraft.maxGB ?? o.maxBackupGB), deleteVerified: Boolean(S.bkDraft.delVer ?? o.deleteVerified) };
-  if (![body.keepBackupDays, body.maxBackupGB].every((n) => Number.isFinite(n) && n >= 0)) return toast(t('err.nonNegative'), { error: true });
+  // Prázdné pole by bylo Number('') = 0 = "smazat hned"
+  if ([S.bkDraft.days, S.bkDraft.maxGB].some((v) => String(v ?? 'x').trim() === '')
+    || ![body.keepBackupDays, body.maxBackupGB].every((n) => Number.isFinite(n) && n >= 0)) return toast(t('err.nonNegative'), { error: true });
   return busy(btn, async () => {
     const { removed } = await api('POST', 'backups/retention', { ...body, dryRun: true });
     if (removed.length) {
@@ -1203,11 +1348,24 @@ const SETTINGS_UI = [
         { k: 'qbitRemoveImported', label: t('settings.field.qbitRemoveImported.label'), help: t('settings.field.qbitRemoveImported.help'), need: 'qbit' },
       ] },
     ] },
+  { id: 'first', icon: 'sparkles', title: t('settings.first.title'), nav: t('settings.first.nav'), lead: t('settings.first.lead', LP),
+    master: { k: 'firstGrab', label: t('settings.field.firstGrab.label'), help: t('settings.field.firstGrab.help') },
+    groups: [
+      { title: t('settings.first.group.what'), live: 'first', fields: [
+        { k: 'firstGrabMovies', label: t('settings.field.firstGrabMovies.label'), help: t('settings.field.firstGrabMovies.help'), dep: 'firstGrab' },
+        { k: 'firstGrabSeries', label: t('settings.field.firstGrabSeries.label'), help: t('settings.field.firstGrabSeries.help'), dep: 'firstGrab' },
+      ] },
+      { title: t('settings.first.group.arr'), fields: [
+        { k: 'firstGrabCancelArr', label: t('settings.field.firstGrabCancelArr.label'), help: t('settings.field.firstGrabCancelArr.help'), dep: 'firstGrab' },
+        { k: 'firstGrabFallback', label: t('settings.field.firstGrabFallback.label'), help: t('settings.field.firstGrabFallback.help'), dep: 'firstGrab' },
+      ] },
+    ] },
   { id: 'merge', icon: 'merge', title: t('settings.merge.title'), nav: t('settings.merge.nav'), lead: t('settings.merge.lead'),
     master: { k: 'mergeEnabled', label: t('settings.field.mergeEnabled.label'), help: t('settings.field.mergeEnabled.help'), need: 'qbit' },
     groups: [
       { fields: [
         { k: 'mergePrimaryDefault', label: t('settings.field.mergePrimaryDefault.label', LP), dep: 'mergeEnabled' },
+        { k: 'mergeCredit', label: t('settings.field.mergeCredit.label'), help: t('settings.field.mergeCredit.help', { name: ucFirst(langName(LANG.pri) || '') }), dep: 'mergeEnabled' },
         { k: 'mergeMaxDonorGB', label: t('settings.field.mergeMaxDonorGB.label'), help: t('settings.field.mergeMaxDonorGB.help'), unit: 'GB', min: 1, dep: 'mergeEnabled' },
         { k: 'mergeSaveData', label: t('settings.field.mergeSaveData.label'), help: t('settings.field.mergeSaveData.help'), dep: 'mergeEnabled' },
         { k: 'mergeMaxOffsetSec', label: t('settings.field.mergeMaxOffsetSec.label'), unit: 's', min: 1, max: 600, dep: 'mergeEnabled' },
@@ -1255,7 +1413,6 @@ const setVal = (k) => (k in S.draft ? S.draft[k] : S.settings.settings[k]);
 const setDef = (k) => S.settings.defaults?.[k];
 const keysOf = (f) => (f.k2 ? [f.k, f.k2] : [f.k]);
 const needOk = (f) => !f.need || !!SET_NEEDS[f.need][0]();
-const fold = (s) => String(s).normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase();
 S.setQ = '';
 
 function fmtSetting(f, k, v) {
@@ -1542,6 +1699,16 @@ function settingsLive() {
     else if (g.lastUsedAt) lines.push(`${icon('activity')}<span>${t('settings.live.gpuLastUsed', { ago: ago(g.lastUsedAt) })}</span>`);
     gpuBox.innerHTML = lines.map((l) => `<p>${l}</p>`).join('');
   }
+  const first = $('[data-live="first"]');
+  if (first) {
+    const f = ov.firstGrab;
+    first.hidden = !setVal('firstGrab');
+    first.innerHTML = [
+      f && (f.current || f.queue || f.downloading)
+        ? `${icon('activity')}<span>${f.current ? t('settings.live.firstPicking', { title: `<b>${esc(f.current)}</b>` }) : t('settings.live.firstQueue', { items: t('count.items', { count: f.queue }) })}${f.downloading ? ` · ${t('settings.live.firstDownloading', { count: f.downloading })}` : ''}</span>`
+        : `${icon('check')}<span>${t('settings.live.firstIdle')}</span>`,
+    ].map((l) => `<p>${l}</p>`).join('') + jellyseerrHint(ov.jellyseerr);
+  }
   const stalls = $('[data-live="stalls"]');
   if (stalls) {
     const q = ov.stalls;
@@ -1550,6 +1717,25 @@ function settingsLive() {
       stalls.innerHTML = `<p>${icon('layers')}<span>${t('settings.live.stopped', { count: q.stopped, tag: '<b>updaterr-stalled</b>' })}${q.watching ? ` · ${t('settings.live.stalledMore', { count: q.watching })}` : ''}</span></p>`;
     }
   }
+}
+
+// Jellyseerr (jen když je připojený): po přidání nesmí spouštět hledání v Radarru/Sonarru
+function jellyseerrHint(js) {
+  if (!js) return '';
+  if (js.error) return `<p>${icon('alert')}<span>${esc(t('jellyseerr.error', { error: js.error }))}</span></p>`;
+  const all = [...js.radarr.map((s) => ({ ...s, app: 'Radarr' })), ...js.sonarr.map((s) => ({ ...s, app: 'Sonarr' }))];
+  const on = all.filter((s) => s.search);
+  if (!all.length) return '';
+  if (!on.length) return `<p>${icon('check')}<span>${t('jellyseerr.ok')}</span></p>`;
+  const where = js.url ? `<a href="${esc(js.url)}/settings/services" target="_blank" rel="noopener">${t('jellyseerr.where')}</a>` : `<b>${t('jellyseerr.where')}</b>`;
+  const names = on.map((s) => `<b>${esc(s.app)}</b>${s.name.toLowerCase() !== s.app.toLowerCase() ? ` (${esc(s.name)})` : ''}${s.is4k ? ' 4K' : ''}`).join(', ');
+  return `<p>${icon('alert')}<span>${t('jellyseerr.on', { names })}</span></p>
+    <ol class="steps-list">
+      <li>${t('jellyseerr.step1', { where })}</li>
+      <li>${t('jellyseerr.step2', { names })}</li>
+      <li>${t('jellyseerr.step3')}</li>
+      <li>${t(on.length > 1 ? 'jellyseerr.step4Each' : 'jellyseerr.step4')}</li>
+    </ol>`;
 }
 
 function settingsFilter() {
@@ -1585,9 +1771,27 @@ function onSettingInput(e) {
 $('#view-settings').addEventListener('input', onSettingInput);
 $('#view-settings').addEventListener('change', onSettingInput);
 
+// Změna retence záloh v Nastavení maže hned – stejně jako v záložce Zálohy nejdřív ukázat, co se smaže
+async function confirmRetention(draft) {
+  const keys = ['keepBackupDays', 'maxBackupGB', 'backupDeleteVerified'];
+  if (!keys.some((k) => k in draft)) return true;
+  const cur = S.settings.settings;
+  const val = (k) => (k in draft ? draft[k] : cur[k]);
+  const body = { keepBackupDays: val('keepBackupDays'), maxBackupGB: val('maxBackupGB'), deleteVerified: val('backupDeleteVerified'), dryRun: true };
+  const { removed } = await api('POST', 'backups/retention', body);
+  if (!removed.length) return true;
+  const free = removed.reduce((s, r) => s + r.exclusive, 0);
+  return confirmDialog({
+    title: t('confirm.retention.title', { count: removed.length }),
+    text: t('confirm.retention.text', { list: removed.map((r) => `${r.label} (${{ age: t('confirm.retention.older'), verified: t('confirm.retention.verified'), size: t('confirm.retention.overLimit') }[r.why]})`).join(', '), size: free ? gb(free) : '0 GB' }),
+    ok: t('confirm.retention.ok'), danger: true,
+  });
+}
+
 async function saveSettings(btn) {
   if (!Object.keys(S.draft).length || $('#savebar')?.classList.contains('bad')) return;
   await busy(btn || $('[data-act="save"]'), async () => {
+    if (!(await confirmRetention(S.draft))) return;
     const r = await api('PUT', 'settings', S.draft);
     S.settings.settings = r.settings;
     S.draft = {};
@@ -1618,7 +1822,14 @@ async function act(btn, e) {
       if (!c) return undefined;
       // Horší obraz kvůli lepšímu jazyku (starší záznamy mají jen text varování)
       const lower = c.lowerRes ?? c.warnings?.some((w) => w.includes('nižší'));
-      if (lower || c.set || c.seasons?.length > 1) {
+      if (c.kind === 'merge' && c.set) {
+        const ok = await confirmDialog({
+          title: t('confirm.mergeSet.title'),
+          text: t('confirm.mergeSet.text', { torrents: t('count.torrents', { count: c.parts.length }), size: gb(c.size), lang: langLabel(c.mergeLang) }),
+          ok: t('option.addAudio'),
+        });
+        if (!ok) return undefined;
+      } else if (lower || c.set || c.seasons?.length > 1) {
         const ok = await confirmDialog({
           title: c.set ? t('confirm.grab.setTitle') : c.seasons?.length > 1 ? t('confirm.grab.packTitle') : t('confirm.grab.lowerTitle'),
           text: [lower && t('confirm.grab.lowerRes', { from: p.current?.res ? `${p.current.res}p` : '?', to: c.res ? `${c.res}p` : '?' }), c.set && t('confirm.grab.set', { count: c.parts.length }), c.seasons?.length > 1 && (c.notes?.[0] || '')].filter(Boolean).join(' '),
@@ -1626,10 +1837,15 @@ async function act(btn, e) {
         });
         if (!ok) return undefined;
       }
+      S.grabbing[p.id] = c.guid;
       return busy(btn, async () => {
-        const r = await api('POST', `proposals/${d.p}/grab/${encodeURIComponent(d.c)}`);
-        toast(r.download?.type === 'merge' ? t('toast.grabMerge') : t('toast.grabSent'));
-        await refreshAll();
+        try {
+          const r = await api('POST', `proposals/${d.p}/grab/${encodeURIComponent(d.c)}`);
+          toast(r.download?.type === 'merge' ? t('toast.grabMerge') : t('toast.grabSent'));
+        } finally {
+          delete S.grabbing[p.id];
+          await refreshAll();
+        }
       }, t('common.verifying'));
     }
     case 'skip': return busy(btn, async () => { await api('POST', `proposals/${d.p}/reject`, { guid: d.guid }); toast(t('toast.skipped')); await refreshAll(); });
@@ -1664,6 +1880,16 @@ async function act(btn, e) {
         await refreshAll();
       });
     }
+    case 'retrymerge': return busy(btn, async () => {
+      await api('POST', `bad-donors/${encodeURIComponent(d.id)}/retry`);
+      toast(t('toast.retryMerge'));
+      await refreshAll();
+    });
+    case 'unbaddonor': return busy(btn, async () => {
+      await api('DELETE', `bad-donors/${encodeURIComponent(d.id)}`);
+      toast(t('toast.unblocked'));
+      await refreshAll();
+    });
     case 'ignore':
     case 'unignore': return busy(btn, async () => {
       await api('POST', `items/${encodeURIComponent(d.key)}/ignore`, { days: d.act === 'ignore' ? 3650 : 0 });
@@ -1671,17 +1897,26 @@ async function act(btn, e) {
       await refreshAll();
     });
     case 'bulk': {
-      const maxTier = Number(d.tier);
-      const n = S.items.filter((i) => (!S.lib.app || i.app === S.lib.app) && i.current.tier <= maxTier).length;
-      const sec = S.settings?.settings?.searchIntervalSec || 90;
-      const ok = await confirmDialog({
-        title: t('confirm.bulk.title'),
-        text: t('confirm.bulk.text', { items: t('count.items', { count: n }), which: maxTier === 1 ? t('confirm.bulk.noP', LP) : t('confirm.bulk.noPS', LP), sec, dur: t('count.hours', { count: Math.max(1, Math.round((n * sec) / 3600)) }) }),
-        ok: t('confirm.bulk.ok'),
-      });
-      if (!ok) return undefined;
-      return busy(btn, async () => { const r = await api('POST', 'check-all', { maxTier, app: S.lib.app || undefined }); toast(t('toast.queued', { count: r.reset })); await refreshAll(); });
+      const choice = await bulkDialog();
+      if (!choice) return undefined;
+      const app = S.lib.app || undefined;
+      if (choice.startsWith('listen')) {
+        return busy(btn, async () => {
+          const r = await api('POST', 'verify-all', { app, force: choice === 'listen-all' });
+          toast(r.queued ? t('toast.listenQueued', { count: r.queued }) : t('toast.listenNothing'));
+          await refreshAll();
+        });
+      }
+      const maxTier = Number(choice.split('-')[1]);
+      return busy(btn, async () => { const r = await api('POST', 'check-all', { maxTier, app }); toast(t('toast.searchQueued', { count: r.reset })); await refreshAll(); });
     }
+    case 'listencancel': {
+      const q = S.ov?.langQueue || {};
+      const ok = await confirmDialog({ title: t('confirm.listenStop.title'), text: t('confirm.listenStop.text', { n: q.queued }), ok: t('confirm.listenStop.ok'), danger: true });
+      if (!ok) return undefined;
+      return busy(btn, async () => { await api('DELETE', 'verify-all'); toast(t('toast.listenStopped')); await refreshAll(); });
+    }
+    case 'lunverified': S.lib.unverified = !S.lib.unverified; S.lib.limit = 200; return renderLibrary(false);
     case 'sync': return busy(btn, async () => { await api('POST', 'sync'); toast(t('toast.librarySynced')); await refreshAll(); }, '');
     case 'verifylang': return busy(btn, async () => {
       const r = await api('POST', `items/${encodeURIComponent(d.key)}/verify-language`);
@@ -1787,7 +2022,7 @@ async function act(btn, e) {
     }
     case 'testnotify': return busy(btn, async () => { await api('POST', 'notify/test'); toast(t('toast.testSent')); });
     case 'copy':
-      try { await navigator.clipboard.writeText(d.text); toast(t('toast.copied')); } catch { toast(t('toast.copyFailed'), { error: true }); }
+      if (await copyText(d.text)) toast(t('toast.copied')); else toast(t('toast.copyFailed'), { error: true });
       return undefined;
     default: return undefined;
   }
@@ -1919,7 +2154,7 @@ async function refreshAll() {
 // Pravidelné obnovování (jen když je stránka vidět a nic se zrovna nepotvrzuje)
 let ticks = 0;
 setInterval(async () => {
-  if (document.hidden || $('#confirm').open) return;
+  if (document.hidden || $('#confirm').open || $('#bulk').open) return;
   ticks++;
   await loadOverview().catch((e) => { $('#pulse').innerHTML = `<i class="dot err"></i><span>${t('pulse.offline', { msg: esc(e.message) })}</span>`; });
   const every = { proposals: 2, library: 3, activity: 1, backups: 6, log: 2, settings: 6 }[S.tab] || 2;

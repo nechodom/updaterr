@@ -12,13 +12,25 @@ const I18N = require('./i18n');
 const tagOut = (l) => (l === 'other' ? '?' : LANGS.tagOf(l));
 const tierText = (tier, item) => L.tierText(tier, item.origLang);
 
-// Ověření zapnuté a k dispozici, a položka ještě není ověřená (pro tyhle soubory)
+// Položka ještě není ověřená (pro tyhle soubory)
+const unverified = (item) => !item.missing && (!item.langCheck || !sameIds(item.langCheck.fileIds, item.current?.fileIds));
+
+// Ověření zapnuté a k dispozici, a položka ještě není ověřená
 function needsCheck(ctx, item) {
-  if (!ctx.store.settings.verifySpeech || !S.available()) return false;
-  return !item.langCheck || !sameIds(item.langCheck.fileIds, item.current?.fileIds);
+  return Boolean(ctx.store.settings.verifySpeech && S.available() && unverified(item));
 }
 
 // Použít uložené ověření na aktuální stav položky (volá se po každém načtení knihovny)
+// Úroveň souboru z jazyků stop podle poslechu – vždy podle aktuálně nastavených jazyků (po jejich změně
+// by uložená úroveň z doby ověření neplatila); u série nejslabší ze slyšených souborů
+function heardTier(lc, origLang) {
+  const tiers = (lc.files || []).filter((f) => f.tracks?.length).map((f) => {
+    const used = f.tracks.map((x) => x.used).filter(Boolean);
+    return L.tierOf({ pri: used.includes(L.primary()), sec: used.includes(L.secondary()) }, origLang);
+  });
+  return tiers.length ? Math.min(...tiers) : lc.tier;
+}
+
 function applyLangCheck(item) {
   const lc = item.langCheck;
   if (!lc || !item.current) return item;
@@ -31,12 +43,14 @@ function applyLangCheck(item) {
   if (lc.corrected) {
     item.current.tagAudio = item.current.audio;
     item.current.tagTier = item.current.tier;
-    item.current.tier = lc.tier;
+    item.current.tier = heardTier(lc, item.origLang);
     item.current.audio = lc.audio;
     item.current.audioSource = 'poslech';
   }
   return item;
 }
+
+const labelOf = (item) => require('./search').itemLabel(item);
 
 // Soubory k ověření: film celý, u série nejvýš 3 epizody (první, prostřední, poslední)
 async function filesFor(ctx, item) {
@@ -63,7 +77,7 @@ async function checkFile(file, origLang, opts = {}) {
     tracks.push({
       index: t.index, title: t.title || '', tag: t.lang || null,
       detected: det.lang, confidence: det.confidence, samples: det.samples,
-      used: r.lang, corrected: r.corrected,
+      used: r.lang, corrected: r.corrected, ...(r.doubtful ? { doubtful: true } : {}),
     });
   }
   const used = tracks.map((t) => t.used).filter(Boolean);
@@ -79,12 +93,18 @@ async function verify(ctx, item, { reason = I18N.t('langcheck.reason.verify') } 
   const { store } = ctx;
   const files = await filesFor(ctx, item);
   if (!files.length) return { changed: false };
-  const label = require('./search').itemLabel(item);
+  const label = labelOf(item);
   const t0 = Date.now();
   const results = [];
   for (const f of files) results.push(await checkFile(f, item.origLang, speechOpts(store.settings)));
 
   const fresh = store.s.items[item.key] || item;
+  // Poslech trvá minuty – mezitím se soubor mohl vyměnit; výsledek starého souboru k novému nepřipisovat
+  const ids = new Set((fresh.current?.fileIds || []).map(String));
+  if (!results.every((r) => ids.has(String(r.id)))) {
+    store.log('info', I18N.t('langcheck.fileChanged', { label, reason }));
+    return { changed: false };
+  }
   const before = fresh.current.tagTier ?? fresh.current.tier;
   const corrected = results.some((r) => r.tracks.some((t) => t.corrected));
   fresh.langCheck = {
@@ -108,6 +128,9 @@ async function verify(ctx, item, { reason = I18N.t('langcheck.reason.verify') } 
   applyLangCheck(fresh);
   const after = fresh.current.tier;
 
+  // Stopy, kde poslech značce odporuje, ale ne jistě (blízké jazyky, např. CZ × SK) – neopravuje se, jen upozornit
+  const doubts = [...new Set(results.flatMap((r) => r.tracks.filter((t) => t.doubtful).map((t) => I18N.t('langcheck.doubtTrack', { tag: t.tag ? tagOut(t.tag) : I18N.t('langcheck.noTag'), heard: tagOut(t.detected) || t.detected }))))];
+  if (doubts.length) store.log('warn', I18N.t('langcheck.doubtful', { label, tracks: doubts.join(', '), lang: L.label(L.primary()), reason }));
   const fixes = results.flatMap((r) => r.tracks.filter((t) => t.corrected).map((t) => `${t.tag ? tagOut(t.tag) : I18N.t('langcheck.noTag')} → ${tagOut(t.used)}`));
   store.log(corrected ? 'warn' : 'info', corrected
     ? I18N.t('langcheck.mislabeled', { label, fixes: [...new Set(fixes)].join(', '), actual: tierText(after, fresh), reason })
@@ -129,7 +152,8 @@ function prune(ctx, p, item, { note } = {}) {
     && sc(c.tier) >= sc(cur.tier) && c.res >= cur.res;
   const keep = (p.candidates || []).filter((c) => (c.kind === 'merge'
     ? c.mergeLang === need
-    : sc(c.tier) > sc(cur.tier) || codecBetter(c) || (st.qualityUpgrades && c.tier === cur.tier && c.res > cur.res)));
+    // Oprava useknutého souboru: stejný jazyk stačí, dokud je soubor pořád useknutý
+    : (c.kind === 'repair' && cur.truncated && sc(c.tier) >= sc(cur.tier)) || sc(c.tier) > sc(cur.tier) || codecBetter(c) || (st.qualityUpgrades && c.tier === cur.tier && c.res > cur.res)));
   const removed = (p.candidates || []).length - keep.length;
   p.candidates = keep;
   p.current = { ...cur };
@@ -141,37 +165,123 @@ function prune(ctx, p, item, { note } = {}) {
   return removed;
 }
 
-// Na pozadí: ověřit položky čekajících návrhů, které vznikly bez ověření
+// Prázdná fronta hromadného poslechu (Knihovna → Poslechnout vše)
+const EMPTY_QUEUE = () => ({ items: [], total: 0, corrected: 0, failed: 0, startedAt: null });
+
+// Na pozadí: ověřit položky čekajících návrhů, které vznikly bez ověření, a pak frontu hromadného poslechu
 class LangChecker {
   constructor(ctx) {
     this.ctx = ctx;
     this.running = false;
     this.current = null;
+    this.verify = verify;
+    if (!ctx.store.s.langQueue?.items) ctx.store.s.langQueue = EMPTY_QUEUE();
+  }
+
+  get queue() { return this.ctx.store.s.langQueue; }
+
+  /**
+   * Zařadit položky do hromadného poslechu. `force` = poslechnout znovu i už ověřené
+   * (třeba po přechodu na přesnější model). Vrací počet nově zařazených.
+   */
+  enqueueAll(keys, { force = false } = {}) {
+    const q = this.queue;
+    if (!q.items.length) Object.assign(q, EMPTY_QUEUE(), { startedAt: new Date().toISOString() });
+    const have = new Set(q.items.map((e) => e.key));
+    const add = keys.filter((k) => !have.has(k)).map((key) => (force ? { key, force: true } : { key }));
+    q.items.push(...add);
+    q.total += add.length;
+    this.ctx.store.save();
+    return add.length;
+  }
+
+  cancel() {
+    const left = this.queue.items.length;
+    this.ctx.store.s.langQueue = EMPTY_QUEUE();
+    this.ctx.store.save();
+    return left;
+  }
+
+  status() {
+    const q = this.queue;
+    const cur = this.current && this.ctx.store.s.items[this.current];
+    return {
+      queued: q.items.length, total: q.total, done: q.total - q.items.length, corrected: q.corrected, failed: q.failed,
+      current: cur ? labelOf(cur) : null,
+    };
+  }
+
+  // Další položka z fronty: co mezitím zmizelo nebo se ověřilo jinak, vypadne; položky, které se právě
+  // stahují nebo slučují, počkají
+  nextQueued() {
+    const { store } = this.ctx;
+    const q = this.queue;
+    q.items = q.items.filter((e) => store.s.items[e.key] && (e.force || unverified(store.s.items[e.key])));
+    const busy = this.ctx.busyKeys();
+    return q.items.find((e) => !busy.has(e.key)) || null;
   }
 
   async tick() {
     const { store, searcher } = this.ctx;
-    if (this.running || this.current || searcher.busy || !store.settings.verifySpeech || !S.available()) return;
-    const p = Object.values(store.s.proposals).find((x) => x.status === 'pending' && !x.groupKey
+    if (this.running || this.current || searcher.busy || !S.available()) return;
+    const p = store.settings.verifySpeech && Object.values(store.s.proposals).find((x) => x.status === 'pending' && !x.groupKey
       && store.s.items[x.itemKey] && needsCheck(this.ctx, store.s.items[x.itemKey])
       && !this.ctx.busyKeys().has(x.itemKey));
-    if (!p) return;
-    const item = store.s.items[p.itemKey];
+    if (p) return this.check(store.s.items[p.itemKey], I18N.t('langcheck.reason.pending'));
+    const had = this.queue.items.length;
+    const e = this.nextQueued();
+    if (e) {
+      await this.check(store.s.items[e.key], I18N.t('langcheck.reason.library'), e);
+      // další hned, ať hromadný poslech netrvá zbytečně dlouho (hledání má pořád přednost)
+      if (this.queue.items.length) setTimeout(() => this.tick().catch((err) => store.log('error', err.message)), 1000).unref?.();
+    } else if (had && !this.queue.items.length) {
+      this.finished();
+    }
+  }
+
+  async check(item, reason, entry = null) {
+    const { store } = this.ctx;
     this.running = true;
     this.current = item.key;
     try {
-      const r = await verify(this.ctx, item, { reason: I18N.t('langcheck.reason.pending') });
-      if (r.changed && p.status === 'pending') prune(this.ctx, p, store.s.items[item.key] || item);
+      const r = await this.verify(this.ctx, item, { reason });
+      const fresh = store.s.items[item.key] || item;
+      if (r.changed) {
+        for (const p of Object.values(store.s.proposals)) {
+          if (p.status === 'pending' && !p.groupKey && p.itemKey === item.key) prune(this.ctx, p, fresh);
+        }
+        // poslech odhalil horší jazyk, než tvrdily značky → hledat upgrade co nejdřív
+        if (r.after < r.before) fresh.lastSearchedAt = null;
+      }
+      if (entry && r.langCheck?.corrected) this.queue.corrected++;
     } catch (e) {
       // ať se to nezkouší pořád dokola – poznamenat neúspěch k souborům
       item.langCheck = { fileIds: item.current.fileIds, at: new Date().toISOString(), error: e.message, corrected: false };
       store.log('warn', I18N.t('search.langCheckFailed', { label: item.title, error: e.message }));
+      if (entry) this.queue.failed++;
     } finally {
+      if (entry) {
+        const i = this.queue.items.indexOf(entry);
+        if (i >= 0) this.queue.items.splice(i, 1);
+        if (!this.queue.items.length) this.finished();
+      }
       this.running = false;
       this.current = null;
       store.save();
     }
   }
+
+  finished() {
+    const q = this.queue;
+    if (!q.total) return;
+    const text = I18N.t('langcheck.queue.items', { count: q.total })
+      + (q.corrected ? I18N.t('langcheck.queue.corrected', { count: q.corrected }) : I18N.t('langcheck.queue.allOk'))
+      + (q.failed ? I18N.t('langcheck.queue.failed', { count: q.failed }) : '');
+    this.ctx.store.log(q.corrected || q.failed ? 'warn' : 'info', I18N.t('langcheck.queue.doneLog', { text }));
+    this.ctx.inbox?.add({ kind: 'langcheck', level: q.corrected || q.failed ? 'warn' : 'ok', title: I18N.t('langcheck.queue.doneTitle'), text, link: { tab: 'library' } });
+    this.ctx.store.s.langQueue = EMPTY_QUEUE();
+    this.ctx.store.save();
+  }
 }
 
-module.exports = { speechOpts, needsCheck, applyLangCheck, verify, prune, LangChecker, sameIds };
+module.exports = { speechOpts, needsCheck, unverified, applyLangCheck, heardTier, verify, prune, LangChecker, sameIds };

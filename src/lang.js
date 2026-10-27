@@ -67,12 +67,17 @@ function expandPairs(s) {
   });
 }
 
+// Hranice skupin: závorky, "+" a " - " oddělují části názvu – "(CZ/EN)(CZ titulky)" jsou dvě různé informace
+const GROUP = '|';
+
 function tokenize(title) {
   const raw = expandPairs(String(title || '').toLowerCase())
     // "CZtitulky", "CZdab", "ENsub" → rozdělit
     .replace(GLUED_RE, '$1 $2')
-    .split(/[^\p{L}\p{N}]+/u)
-    .filter(Boolean);
+    .replace(/[()[\]{}+]|\s[-–]\s/g, ` ${GROUP} `)
+    .split(/[^\p{L}\p{N}|]+/u)
+    .filter(Boolean)
+    .filter((tok, i, all) => tok !== GROUP || (i > 0 && all[i - 1] !== GROUP));
   // "czsk", "czen", "plen" – dva slepené kódy, z nichž aspoň jeden je hledaný
   const out = [];
   for (const tok of raw) {
@@ -87,6 +92,10 @@ function tokenize(title) {
   return out;
 }
 
+// Konec názvu díla: rok, S01/S01E02, rozlišení. Jazykové zkratky před ním můžou být slova z názvu
+// ("En.man.som.heter.Ove.2015" je švédský film, ne anglická verze).
+const TITLE_END = /^((19|20)\d\d|s\d{1,2}(e\d{1,3})?|\d{3,4}p|season|serie|staffel|saison|temporada|stagione|sezon)$/;
+
 // Najde ve výrazu jazykové zmínky a rozliší, jestli jde o dabing, nebo titulky.
 function parseReleaseTitle(title) {
   const tk = tokenize(title);
@@ -94,6 +103,7 @@ function parseReleaseTitle(title) {
   const subs = new Set();
   let multi = false;
   let dual = false;
+  const titleEnd = tk.findIndex((x) => TITLE_END.test(x));
 
   for (let i = 0; i < tk.length; i++) {
     const tok = tk[i];
@@ -104,6 +114,7 @@ function parseReleaseTitle(title) {
     if (!lang) continue;
 
     // Dopředu: přes řetěz jazyků ("cz en titulky", "cz sk dabing") až k prvnímu ne-jazykovému slovu
+    // (řetěz končí i na hranici skupiny)
     let j = i + 1;
     while (j < tk.length && langOf(tk[j])) j++;
     const after = tk[j];
@@ -114,13 +125,19 @@ function parseReleaseTitle(title) {
     while (k >= 0 && langOf(tk[k])) k--;
     const before = tk[k];
 
+    // V názvu díla platí zkratka jen samostatně ("[CZ] Film 2020", "Film CZ 2020") nebo u slova titulky/dabing
+    if (i < titleEnd) {
+      const explicit = SUB_WORDS.has(after) || DUB_WORDS.has(after) || SUB_WORDS.has(before);
+      if (!explicit && !(after === undefined || after === GROUP || j === titleEnd)) continue;
+    }
+
     let kind = 'audio';
     if (after && SUB_WORDS.has(after)) kind = 'sub';
     else if (after && DUB_WORDS.has(after)) kind = 'audio';
     else if (before && SUB_WORDS.has(before)) kind = 'sub';
     (kind === 'sub' ? subs : audio).add(lang);
   }
-  return { audio, subs, multi, dual, tokens: tk };
+  return { audio, subs, multi, dual, tokens: tk.filter((x) => x !== GROUP) };
 }
 
 // Vyhodnotí jazyk kandidáta (releasu).
@@ -145,8 +162,11 @@ function evaluateRelease(title, { origLang = 'en', arrLangs = [], localIndexer =
   if ((p.multi || p.dual) && !(pri && sec)) {
     // DUAL/MULTI: obvykle originál + dabing
     if (pri && SEC && origLang === SEC) { sec = true; confidence = 'likely'; notes.push(t('lang.note.multiOriginal')); }
-    else if (PRI && !pri && localIndexer) { pri = true; sec = sec || (Boolean(SEC) && origLang === SEC); confidence = 'guess'; notes.push(t('lang.note.multiLocal', { p: P })); }
+    // S titulky v primárním jazyce je ten jazyk jen v titulcích – MULTI z místního trackeru pak dabing nenaznačuje
+    else if (PRI && !pri && localIndexer && !p.subs.has(PRI)) { pri = true; sec = sec || (Boolean(SEC) && origLang === SEC); confidence = 'guess'; notes.push(t('lang.note.multiLocal', { p: P })); }
     else if (!sec && SEC && origLang === SEC) { sec = true; confidence = confidence === 'sure' ? 'likely' : confidence; }
+    // Dílo s originálem v primárním jazyce a DUAL/MULTI: originál je mezi stopami
+    else if (PRI && !pri && origLang === PRI) { pri = true; confidence = 'likely'; notes.push(t('lang.note.multiOriginalPrimary', { p: P })); }
   }
   if (!mentionedAudio && !p.multi && !p.dual && !pri) {
     // Bez zmínky o jazyce = originální znění
@@ -235,10 +255,34 @@ function resolutionFromTitle(title) {
 // Jazyk stávajícího souboru je ověřený: ze značek stop (MediaInfo) nebo poslechem; 'nazev' = jen odhad z názvu
 const audioVerified = (cur) => cur?.audioSource === 'mediainfo' || cur?.audioSource === 'poslech';
 
+// Verze (střih) filmu podle názvu: Extended, Director's Cut… Bez značky = běžná (kino) verze.
+// Délku filmu z názvu nepoznáme – je to jen odhad, potvrdí ho až porovnání délky při slučování.
+// Vedle anglických značek i místní zápisy (prodloužená/rozšířená/režisérská/nesestříhaná verze).
+const EDITIONS = [
+  // EE / EXT = Extended Edition (Tigole „EE“, 3Li „EXT“)
+  ['extended', /\b(extended|prodlouzena|rozsirena|ee|ext)\b/],
+  ['directors', /\b(directors?'?s?[ ._-]?cut|rezisersk[aey])\b/],
+  ['unrated', /\b(unrated|uncut|nesestrihana)\b/],
+  ['ultimate', /\bultimate[ ._-]?(edition|cut)\b/],
+  ['final', /\bfinal[ ._-]?cut\b/],
+];
+function editionOf(title) {
+  const s = String(title || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  const key = EDITIONS.find(([, re]) => re.test(s))?.[0] || 'theatrical';
+  return { key, label: t(`edition.${key}`) };
+}
+// Upozornění, když release podle názvu není stejná verze filmu jako stávající soubor (jinak null)
+function editionWarning(curTitle, relTitle) {
+  const cur = editionOf(curTitle);
+  const rel = editionOf(relTitle);
+  if (cur.key === rel.key) return null;
+  return t(rel.key === 'theatrical' ? 'edition.warningLikely' : 'edition.warning', { cur: cur.label, rel: rel.label });
+}
+
 const JUNK_RE = /\b(cam|camrip|hdcam|ts|hdts|telesync|tc|telecine|hdtc|scr|screener|dvdscr|workprint|3d|sbs|hsbs|half[\s.-]?sbs|half[\s.-]?ou)\b/i;
 
 module.exports = {
   configure, primary, secondary, label, slotCode, tierLabel, tierLabels, tierText, tierSlots,
   WANT_LANGS, normWant, wantLabel, wantScore, audioFromMediaInfo, parseReleaseTitle, evaluateRelease, tierOf, origLangOf,
-  qualityRank, resolutionOf, resolutionFromTitle, JUNK_RE, normLangCode, audioVerified,
+  qualityRank, resolutionOf, resolutionFromTitle, JUNK_RE, normLangCode, audioVerified, editionOf, editionWarning,
 };

@@ -10,8 +10,10 @@ const S = require('./seasons');
 const { newId } = require('./store');
 const { fetchReleases, searchItem, itemLabel, seasonLabel, combineCurrent, reopenProposal } = require('./search');
 const { refreshItem, minCodec } = require('./library');
+const { badDonorOf, badDonorCode } = require('./merge');
 const LC = require('./langcheck');
 const { t } = require('./i18n');
+const W = require('./watch');
 
 const FRESH_MS = 20 * 60e3;            // výsledky hledání starší než tohle před stažením ověříme znovu
 const UPGRADE_REJECTION = /upgrade|cutoff|existing (movie |episode )?file|custom format/i;
@@ -19,6 +21,8 @@ const UPGRADE_REJECTION = /upgrade|cutoff|existing (movie |episode )?file|custom
 const PARSE_REJECTION = /unable to parse/i;
 const VIDEO_EXT = /\.(mkv|mp4|m4v|avi|ts|m2ts|wmv|mov|mpe?g)$/i;
 const GONE = new Set(['failed', 'dismissed']);
+// Stav fronty Radarru/Sonarru, kdy torrent stát smí: čeká ve frontě qBittorrentu, je ručně zastavený, klient neodpovídá
+const WAITING = /^(queued|paused|delay|downloadClientUnavailable)$/i;
 
 const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 const reasons = (x) => (x.rejections || []).map((r) => (typeof r === 'string' ? r : r?.reason || '')).filter(Boolean);
@@ -155,6 +159,7 @@ class Downloads {
       parts,
       grabbedAt: Date.now(),
       state: 'grabbed', active: true, auto,
+      first: Boolean(p.first), // první stažení nové položky (firstgrab.js) – žádný soubor se nenahrazuje
       attempt: retryOf ? (retryOf.attempt || 1) + 1 : 1,
       retryOf: retryOf?.id || null,
       progress: 0,
@@ -177,9 +182,12 @@ class Downloads {
       : multiSeason ? t('download.how.multi', { seasons: S.formatSeasons(cand.seasons), targets: S.formatSeasons(cand.targetSeasons) }) : '';
     store.log('info', t('download.grabbing', {
       label, title: cand.title, indexer: cand.indexer, seeders: cand.seeders ?? '?', how,
-      auto: auto ? t('download.tag.auto') : '', retry: retryOf ? t('download.tag.retry', { attempt: d.attempt }) : '',
+      auto: d.first ? t('download.tag.first') : auto ? t('download.tag.auto') : '', retry: retryOf ? t('download.tag.retry', { attempt: d.attempt }) : '',
     }));
     store.save();
+    // Vlastní torrent poznat podle hashe (z historie Radarru/Sonarru), ať se nesplete s tím, co Radarr/Sonarr
+    // stáhl sám – jinak by se mohl převzít (a po importu smazat) cizí torrent téhož filmu
+    await this.ctx.firstGrab?.identify(d).catch(() => {});
     if (auto || retryOf) notify.download(d, 'grabbed').catch(() => {});
     return d;
   }
@@ -204,7 +212,8 @@ class Downloads {
     d.state = 'cancelled';
     d.finishedAt = Date.now();
     if (missing.length) d.message = t(d.app === 'radarr' ? 'download.notInQueue.radarr' : 'download.notInQueue.sonarr', { titles: missing.join(', ') });
-    reopenProposal(this.ctx, d, { note: t('download.note.cancelled') });
+    if (d.first) await this.ctx.firstGrab.giveUp(d, t('download.giveUp.cancelled'), { search: false });
+    else reopenProposal(this.ctx, d, { note: t('download.note.cancelled') });
     store.log('info', missing.length ? t('download.cancelledMissing', { label: d.label, message: d.message }) : t('download.cancelled', { label: d.label }));
     store.save();
   }
@@ -219,7 +228,10 @@ class Downloads {
       for (const d of list) {
         try {
           queues[d.app] ??= await this.client(d.app).queue();
-          await this.check(d, queues[d.app]);
+          // První stažení: co mezitím stáhl sám Radarr/Sonarr, zrušit (a z fronty vyřadit, ať se nespáruje)
+          if (d.first) queues[d.app] = await this.ctx.firstGrab.cancelForeign(d, queues[d.app]);
+          if (d.active) await this.check(d, queues[d.app]); // mezitím zrušeno → nesahat
+
         } catch (e) {
           this.ctx.store.log('warn', t('download.checkFailed', { label: d.label, error: e.message }));
         }
@@ -243,9 +255,12 @@ class Downloads {
     const byTitle = same.find((r) => norm(r.title) === norm(part.title));
     if (byTitle) return byTitle;
     if (d.parts?.length > 1) return null; // u sady epizod bez shody nehádat
+    // Hash známe (z hledání nebo z historie), ale ve frontě není → je to jiný torrent, nehádat
+    if (hash) return null;
     const claimed = new Set(this.active().filter((x) => x.id !== d.id).flatMap((x) => this.partsOf(x).map((y) => hashOf(y.downloadId))).filter(Boolean));
     const free = [...new Map(same.filter((r) => !claimed.has(hashOf(r.downloadId))).map((r) => [r.downloadId, r])).values()];
-    return free.length === 1 ? free[0] : null;
+    // Odhad (jediný záznam filmu ve frontě) může být i stažení Radarru – označit, ať se jeho hash nepřevezme
+    return free.length === 1 ? { ...free[0], guessed: true } : null;
   }
 
   // Položky, jejichž soubory se od stažení změnily: { [itemKey]: nový stav }
@@ -267,28 +282,51 @@ class Downloads {
     const now = Date.now();
     const parts = this.partsOf(d);
     let inQueue = 0;
+    // Hash vlastního torrentu ještě neznáme (historie se zapisuje se zpožděním) → zkusit znovu
+    if (parts.some((x) => !GONE.has(x.state) && !x.downloadId && !x.infoHash)) await this.ctx.firstGrab?.identify(d).catch(() => {});
+    if (!d.active) return;
 
     for (const part of parts) {
       if (GONE.has(part.state)) continue;
       const q = this.findInQueue(d, part, records);
       if (!q) {
-        if (!part.seenInQueue && now - d.grabbedAt > 15 * 60e3 && await this.fail(d, t('download.neverAppeared'), part)) return;
+        if (!part.seenInQueue && now - d.grabbedAt > 15 * 60e3) {
+          // Rychlé stažení mohlo proběhnout i s importem mezi dvěma koly – to dořeší souhrn níže
+          if (parts.length === 1 && Object.keys(await this.changedTargets(d)).length) continue;
+          // Fronta Radarru/Sonarru je prázdná i při výpadku qBittorrentu – to není chyba torrentu.
+          // Torrent v qBittorrentu je, jen ho Radarr/Sonarr ve frontě nespároval → dát mu čas (jako u „ztraceného“)
+          const client = await this.clientState(d, [part]);
+          if (client?.down || (client?.present && now - d.grabbedAt < 6 * 3600e3)) { d.message = client.message; continue; }
+          if (await this.fail(d, t('download.neverAppeared'), part)) return;
+        }
         continue;
       }
       inQueue++;
       part.seenInQueue = true;
       part.lastSeenInQueue = now;
       part.queueId = q.id;
-      part.downloadId = q.downloadId || part.downloadId;
+      if (q.guessed) {
+        part.guessed = true; // spárováno jen odhadem – hash nepřebírat (úklid by mohl smazat cizí torrent)
+        part.queueDownloadId = q.downloadId || null; // jen pro vynucený import tohohle záznamu fronty
+      } else part.downloadId = q.downloadId || part.downloadId;
       const size = Number(q.size) || 0;
       const left = Number(q.sizeleft) || 0;
+      // Velikost 0 = magnet ještě nemá metadata: nic se nestahuje, ale ani není staženo
+      const noMeta = size <= 0;
+      // Metadata dorazila (nebo se změnil obsah) – výchozí bod pro pokrok měřit znovu od teď
+      if (!noMeta && part.size !== size) {
+        part.lastSizeLeft = left;
+        part.lastProgressAt = now;
+      }
       part.size = size;
       part.progress = size ? Math.max(0, Math.min(1, 1 - left / size)) : 0;
       // Výchozí bod posouvat jen při pokroku – jinak by pomalý torrent (pár kB/s) vypadal jako mrtvý
-      if (part.lastSizeLeft == null || left < part.lastSizeLeft - 5e6) {
+      if (!noMeta && (part.lastSizeLeft == null || left < part.lastSizeLeft - 5e6)) {
         part.lastProgressAt = now;
         part.lastSizeLeft = left;
       }
+      // Čeká ve frontě klienta, je ručně zastavený nebo klient nejede – to se za "žádný pokrok" nepočítá
+      if (WAITING.test(q.status || '')) part.lastProgressAt = now;
       part.queueState = q.trackedDownloadState || q.status;
       part.message = (q.statusMessages || []).flatMap((m) => m.messages || [m.title]).filter(Boolean).join(' · ') || q.errorMessage || '';
       part.timeleft = q.timeleft || null;
@@ -298,7 +336,7 @@ class Downloads {
         inQueue--;
         continue;
       }
-      if (left > 0) {
+      if (left > 0 || noMeta) {
         part.state = 'downloading';
         if (now - (part.lastProgressAt || d.grabbedAt) > st.stallHours * 3600e3) {
           if (await this.fail(d, t('download.noProgress', { hours: st.stallHours }), part)) return;
@@ -311,12 +349,14 @@ class Downloads {
       part.completedAt ??= now;
       const blocked = /importBlocked|importPending|importFailed/i.test(q.trackedDownloadState || '') && q.trackedDownloadStatus !== 'ok';
       if (!blocked || now - part.completedAt <= 2 * 60e3) continue;
-      if (!part.forceImportAt) {
-        if (st.forceImport) await this.forceImport(d, part);
-      } else if (now - part.forceImportAt > 5 * 60e3 && parts.length === 1 && Object.keys(await this.changedTargets(d)).length) {
+      // Bez vynuceného importu se počítá od dokončení (jinak by blokovaný import visel navždy)
+      const blockedSince = part.forceImportAt || (!st.forceImport && part.completedAt);
+      if (!blockedSince) {
+        await this.forceImport(d, part);
+      } else if (part.forceImportAt && now - part.forceImportAt > 5 * 60e3 && parts.length === 1 && Object.keys(await this.changedTargets(d)).length && !(await this.importRunning(d, part))) {
         // Vynucený import proběhl, ve frontě visí jen zbytek (např. série z balíku, které nenahrazujeme)
         await this.dismiss(d, part, t('download.importedRest'));
-      } else if (now - part.forceImportAt > 15 * 60e3) {
+      } else if (now - blockedSince > 15 * 60e3) {
         part.state = 'blocked';
         if (!d.blockedNotified) {
           d.blockedNotified = true;
@@ -325,11 +365,12 @@ class Downloads {
           notify.download(d, 'blocked').catch(() => {});
         }
         // Občas zkusit znovu – soubor mohl někdo přejmenovat nebo se změnila pravidla importu
-        if (st.forceImport && now - part.forceImportAt > 6 * 3600e3) await this.forceImport(d, part);
+        if (st.forceImport && part.forceImportAt && now - part.forceImportAt > 6 * 3600e3) await this.forceImport(d, part);
       }
       if (part.state === 'dismissed') inQueue--;
     }
 
+    if (!d.active) return; // selhalo nebo zrušeno během kontroly
     // Souhrn za všechny torrenty
     const alive = parts.filter((x) => x.state !== 'failed');
     d.progress = alive.length ? alive.reduce((a, x) => a + (x.state === 'dismissed' ? 1 : x.progress || 0), 0) / alive.length : 0;
@@ -349,6 +390,7 @@ class Downloads {
 
     // Ve frontě nic není → buď naimportováno, nebo se ztratilo
     const changed = await this.changedTargets(d);
+    if (!d.active) return;
     const keys = Object.keys(changed);
     if (keys.length) {
       // MediaInfo se po importu chvíli počítá
@@ -358,6 +400,7 @@ class Downloads {
         const { mediaInfoKnown, ...current } = changed[k];
         store.s.items[k].current = current;
         store.s.items[k].lastSearchedAt = new Date().toISOString();
+        delete store.s.items[k].missing;
       }
       const results = keys.map((k) => changed[k]);
       d.active = false;
@@ -370,17 +413,21 @@ class Downloads {
       };
       d.message = parts.some((x) => x.forceImportAt) ? t('download.forcedImported', { app: d.app === 'radarr' ? 'Radarr' : 'Sonarr' }) : '';
       const warnings = [];
+      // Verze k dabingu (cutmatch): release sám slibuje jen jazyk obrazu, druhý jazyk přidá až navazující sloučení
+      const promised = d.candidate.baseTier ?? d.candidate.tier;
       // Než release obviníme ze lži: možná jen nový soubor má chybně označené stopy → ověřit poslechem
-      if (d.result.tier < d.candidate.tier && keys.some((k) => LC.needsCheck(this.ctx, store.s.items[k]))) {
+      if (d.result.tier < promised && keys.some((k) => LC.needsCheck(this.ctx, store.s.items[k]))) {
         for (const k of keys) {
           try { await LC.verify(this.ctx, store.s.items[k], { reason: t('download.reason.afterDownload') }); } catch (e) { store.log('warn', t('download.langCheckFailed', { label: d.label, error: e.message })); }
         }
         const now2 = keys.map((k) => store.s.items[k].current);
         d.result = { ...d.result, tier: Math.min(...now2.map((c) => c.tier)), audio: uniqJoin(now2.map((c) => c.audio)) };
       }
-      if (d.result.tier < d.candidate.tier) {
-        warnings.push(t('download.warn.lied', { promised: L.tierLabel(d.candidate.tier), got: L.tierLabel(d.result.tier), audio: d.result.audio }));
-        store.s.ignoredGuids[d.guid] = now;
+      // Spárováno jen odhadem → naimportovat mohl i Radarr/Sonarr něco svého; release za to neblokovat
+      const guessed = parts.some((x) => x.guessed && !x.downloadId);
+      if (d.result.tier < promised) {
+        warnings.push(t('download.warn.lied', { promised: L.tierLabel(promised), got: L.tierLabel(d.result.tier), audio: d.result.audio }) + (guessed ? t('download.warn.liedGuessed') : ''));
+        if (!guessed) store.s.ignoredGuids[d.guid] = now;
       }
       // Upgrade kvůli formátu videa: release o kodeku lhal (v názvu x265, soubor H.264)
       if (d.candidate.kind === 'codec' && d.result.vcodec != null && d.candidate.vcodec != null && d.result.vcodec < d.candidate.vcodec) {
@@ -394,22 +441,115 @@ class Downloads {
       if (warnings.length) {
         d.warning = warnings.join(' · ');
         store.log('warn', `${d.label}: ${d.warning}`);
+      } else if (d.first) {
+        store.log('info', t('download.doneFirst', { label: d.label, tier: L.tierLabel(d.result.tier), audio: d.result.audio, quality: d.result.quality }));
       } else {
         const codec = d.candidate.kind === 'codec' ? `, ${d.prev.vcodecName || '?'} → ${d.result.vcodecName}` : '';
         store.log('info', t('download.done', { label: d.label, from: L.tierLabel(d.prev.tier), to: L.tierLabel(d.result.tier), audio: d.result.audio, quality: d.result.quality + codec }));
       }
+      if (d.first) {
+        const firstItems = keys.map((k) => store.s.items[k]);
+        for (const it of W.watchFirst(store, firstItems)) {
+          store.log('info', t(it.watch?.auto || store.s.watchSeries?.[it.arrId]?.auto ? 'download.firstWatchAuto' : 'download.firstWatch', { what: it.app === 'sonarr' ? it.title : itemLabel(it) }));
+        }
+        // Série, které z balíku zůstaly bez souboru, vrátit Sonarru
+        await this.ctx.firstGrab.giveUp(d, t('download.giveUp.notInPack'), { keepProposal: true });
+      }
+      if (d.candidate.kind === 'cutmatch') await this.chainMerge(d);
       notify.download(d, 'done').catch(() => {});
       return;
     }
     const lastSeen = Math.max(0, ...parts.map((x) => x.lastSeenInQueue || 0));
     if (lastSeen && now - lastSeen > 30 * 60e3) {
+      // Než stahování odepíšeme: zeptat se qBittorrentu přímo. Když neodpovídá, Radarr/Sonarr ho ve frontě
+      // nevidí, ale torrent je pořád v něm – počkat. Když torrent v qBittorrentu je, dát Radarru/Sonarru čas.
+      const client = await this.clientState(d, parts);
+      if (client?.down || (client?.present && now - lastSeen < 6 * 3600e3)) {
+        d.message = client.message;
+        return;
+      }
       d.active = false;
       d.state = 'lost';
       d.finishedAt = now;
       d.message = t('download.lost');
-      reopenProposal(this.ctx, d, { note: t('download.note.lost') });
+      if (d.first) await this.ctx.firstGrab.giveUp(d, t('download.giveUp.lost'));
+      else reopenProposal(this.ctx, d, { note: t('download.note.lost') });
       store.log('warn', `${d.label}: ${d.message}`);
       notify.download(d, 'lost').catch(() => {});
+    }
+  }
+
+  // Verze k dabingu (search.js cutMatchCandidates): nový soubor je naimportovaný → rovnou do něj přidat zvuk
+  // z donoru, který byl součástí schváleného návrhu. Když donor mezitím zmizel, vezme se jiný stejné verze.
+  async chainMerge(d) {
+    const { store } = this.ctx;
+    const item = store.s.items[d.itemKey];
+    const donor = d.candidate.donor;
+    if (!item || !donor) return;
+    const need = L.label(donor.mergeLang);
+    try {
+      if (item.current.truncated) throw new Error(t('download.chain.truncated'));
+      if (item.current.tier >= 3) {
+        store.log('info', t('download.chain.hasAudio', { label: d.label, lang: need }));
+        return;
+      }
+      // Donor neprošel sloučením se starým souborem kvůli délce (jiný střih) – k novému souboru to neplatí
+      const bad = badDonorOf(store, item.key, donor);
+      if (bad && badDonorCode(bad) === 'length') delete store.s.badDonors[bad.id];
+      const res = await searchItem(this.ctx, item, { reason: t('download.chain.reason'), silent: true });
+      const cands = res.proposal?.candidates || [];
+      let idx = cands.findIndex((c) => c.kind === 'merge' && !c.set && (c.guid === donor.guid || c.title === donor.title));
+      if (idx < 0) idx = cands.findIndex((c) => c.kind === 'merge' && !c.set && c.mergeLang === donor.mergeLang && !c.otherCut);
+      if (idx < 0) throw new Error(t('download.chain.noDonor'));
+      const title = cands[idx].title;
+      const j = await this.ctx.grab(res.proposal.id, idx, { auto: true });
+      d.chainedMergeId = j.id;
+      store.log('info', t('download.chain.started', { label: d.label, lang: need, title }));
+    } catch (e) {
+      d.warning = [d.warning, t('download.chain.failedShort', { lang: need, error: e.message })].filter(Boolean).join(' · ');
+      store.log('warn', t('download.chain.failed', { label: d.label, lang: need, error: e.message }));
+    }
+    store.save();
+  }
+
+  // První stažení balíku selhalo a náhrada pokrývá jen část sérií: zbylé vrátit prvnímu stažení
+  // (firstgrab.js je předá Sonarru) – jinak by na ně čekalo stahování, které už neběží
+  async returnUncovered(d, replacement, reason) {
+    const covered = new Set(replacement.itemKeys || [replacement.itemKey]);
+    const rest = (d.itemKeys || [d.itemKey]).filter((k) => !covered.has(k));
+    if (rest.length) await this.ctx.firstGrab.giveUp({ ...d, proposalId: null, itemKeys: rest }, t('download.giveUp.notInReplacement', { reason }));
+    return rest;
+  }
+
+  // Stav torrentů stahování přímo v qBittorrentu: null = nejde ověřit (není nastavený),
+  // { down } = neodpovídá, { present } = aspoň jeden torrent tam pořád je
+  async clientState(d, parts) {
+    const q = this.ctx.qbit;
+    if (!q?.enabled || d.candidate?.protocol === 'usenet') return null;
+    const hashes = parts.filter((x) => !GONE.has(x.state)).map((x) => String(x.downloadId || x.infoHash || '').toLowerCase())
+      .filter((h) => /^[0-9a-f]{40}$/.test(h));
+    try {
+      if (!hashes.length) {
+        await q.version();
+        return { present: false, message: '' };
+      }
+      const list = await q.byHashes(hashes);
+      const present = (list || []).length > 0;
+      return { present, message: present ? t('download.client.present', { app: d.app === 'radarr' ? 'Radarr' : 'Sonarr' }) : '' };
+    } catch (e) {
+      return { down: true, message: t('download.client.down', { error: e.message }) };
+    }
+  }
+
+  // Vynucený import ještě běží (první epizoda už je v knihovně, další se kopírují) – dokud neskončí, torrent
+  // nepouštět: po "hotovo" by ho úklid smazal i se soubory, které se ještě nenaimportovaly
+  async importRunning(d, part) {
+    if (part.forceImportCmd == null) return false;
+    try {
+      const cmd = await this.client(d.app).get(`/command/${part.forceImportCmd}`);
+      return ['queued', 'started'].includes(cmd?.status);
+    } catch {
+      return false; // příkaz už Radarr/Sonarr zapomněl (restart) – doběhl
     }
   }
 
@@ -430,7 +570,8 @@ class Downloads {
     const { store, notify } = this.ctx;
     part.forceImportAt = Date.now();
     const client = this.client(d.app);
-    const list = await client.manualImportList(part.downloadId);
+    const downloadId = part.downloadId || part.queueDownloadId;
+    const list = await client.manualImportList(downloadId);
     const unparsed = (f) => d.app === 'radarr' && reasons(f).some((r) => PARSE_REJECTION.test(r));
     let usable = list.filter((f) => {
       const rs = reasons(f);
@@ -444,6 +585,7 @@ class Downloads {
     if (usable.some(unparsed)) usable = [usable.reduce((a, f) => ((f.size || 0) > (a.size || 0) ? f : a))];
     if (!usable.length) {
       if (Object.keys(await this.changedTargets(d)).length) {
+        if (await this.importRunning(d, part)) return;
         await this.dismiss(d, part, t('download.importedWhatCould'));
         return;
       }
@@ -462,12 +604,13 @@ class Downloads {
       // Kvalitu/jazyky, které Radarr z názvu nevyčetl, doplnit podle stahovaného release
       const quality = f.quality?.quality ? f.quality : d.candidate?.arr?.quality;
       const languages = f.languages?.length ? f.languages : d.candidate?.arr?.languages || [];
-      const base = { path: f.path, quality, languages, releaseGroup: f.releaseGroup, downloadId: part.downloadId, indexerFlags: f.indexerFlags || 0 };
+      const base = { path: f.path, quality, languages, releaseGroup: f.releaseGroup, downloadId, indexerFlags: f.indexerFlags || 0 };
       return d.app === 'radarr'
         ? { ...base, movieId: d.arrId }
         : { ...base, seriesId: d.arrId, episodeIds: f.episodes.map((e) => e.id), releaseType: f.releaseType };
     });
-    await client.command({ name: 'ManualImport', importMode: 'auto', files });
+    const cmd = await client.command({ name: 'ManualImport', importMode: 'auto', files });
+    part.forceImportCmd = cmd?.id ?? null;
     store.log('info', t('download.forcing', {
       label: d.label, app: d.app, count: files.length,
       seasons: d.seasons ? t('download.forcingSeasons', { seasons: S.formatSeasons(d.seasons), count: d.seasons.length }) : '',
@@ -478,6 +621,7 @@ class Downloads {
   // jinak skončí celé stahování (vrací true) a případně se stáhne další kandidát.
   async fail(d, reason, part) {
     const { store, notify } = this.ctx;
+    if (!d.active) return true; // mezitím zrušeno – neblokovat release ani nestahovat náhradu
     const st = store.settings;
     const parts = this.partsOf(d);
     part ??= parts[0];
@@ -505,7 +649,14 @@ class Downloads {
         const res = await searchItem(this.ctx, item, { reason: t('download.reason.replacement'), silent: true });
         const next = d.groupKey ? res.groupProposal : res.proposal;
         if (next) {
-          d.replacedBy = (await this.ctx.grab(next.id, 0, { retryOf: d })).id;
+          const r = await this.ctx.grab(next.id, 0, { retryOf: d });
+          d.replacedBy = r.id;
+          // Původní návrh by jinak navždy visel jako „stahuje se“ (a nešel by odmítnout)
+          const old = store.s.proposals[d.proposalId];
+          if (old && old.id !== next.id && old.downloadId === d.id && old.status === 'grabbed') {
+            Object.assign(old, { status: 'expired', note: `nahrazeno: ${reason}`, updatedAt: new Date().toISOString() });
+          }
+          if (d.first) await this.returnUncovered(d, r, reason);
           return true;
         }
         d.message += t('download.noAlternative');
@@ -513,7 +664,8 @@ class Downloads {
         d.message += t('download.replacementFailed', { error: e.message });
       }
     }
-    reopenProposal(this.ctx, d, { dropGuid: d.guid, note: t('common.prevAttemptFailed', { reason }) });
+    if (d.first) await this.ctx.firstGrab.giveUp(d, t('download.giveUp.failed', { reason }));
+    else reopenProposal(this.ctx, d, { dropGuid: d.guid, note: t('common.prevAttemptFailed', { reason }) });
     notify.download(d, 'failed').catch(() => {});
     return true;
   }

@@ -14,13 +14,20 @@ const partsOf = (d) => d.parts || [{ downloadId: d.downloadId }];
  * prázdné (v qBittorrentu už nic není), záznam se pak jen označí jako uklizený.
  */
 function plan(downloads, torrents, busy) {
-  const present = new Set(torrents.map((t) => hashOf(t.hash)));
+  // Jen úplně stažené torrenty, přidané nejpozději při dokončení úlohy (stejný hash mohl někdo stáhnout znovu)
+  const byHash = new Map(torrents.map((t) => [hashOf(t.hash), t]));
+  const removable = (h, d) => {
+    const t = byHash.get(h);
+    return t && Number(t.progress) >= 1 && !(d.finishedAt && t.added_on && t.added_on * 1000 > d.finishedAt);
+  };
   const out = [];
   for (const d of downloads) {
     if (d.state !== 'done' || d.torrentsRemoved) continue;
     const hashes = [...new Set(partsOf(d).map((p) => hashOf(p.downloadId)).filter(Boolean))];
     if (hashes.some((h) => busy.has(h))) continue; // stejný torrent stahuje jiná úloha – počkat, až doběhne
-    out.push({ d, hashes: hashes.filter((h) => present.has(h)) });
+    // Nedostažený torrent nechat a zkusit příště (záznam se neoznačí jako uklizený)
+    if (hashes.some((h) => byHash.has(h) && !removable(h, d))) continue;
+    out.push({ d, hashes: hashes.filter((h) => byHash.has(h)) });
   }
   return out;
 }
@@ -37,7 +44,7 @@ class TorrentCleanup {
     if (!all.some((d) => d.state === 'done' && !d.torrentsRemoved)) return;
     const busy = new Set([
       ...downloads.active().flatMap((d) => partsOf(d).map((p) => hashOf(p.downloadId))),
-      ...merger.active().map((j) => hashOf(j.hash)),
+      ...merger.active().flatMap((j) => (j.parts || [j]).map((x) => hashOf(x.hash))),
     ].filter(Boolean));
     const torrents = (await qbit.req('torrents/info')) || [];
     const todo = plan(all, torrents, busy);

@@ -14,6 +14,7 @@
   <svg width="0" height="0" style="position:absolute" aria-hidden="true">
     <defs>
       <symbol id="i-inbox" viewBox="0 0 24 24"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11Z"/></symbol>
+      <symbol id="i-headphones" viewBox="0 0 24 24"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/></symbol>
       <symbol id="i-library" viewBox="0 0 24 24"><path d="m16 6 4 14M12 6v14M8 8v12M4 4v16"/></symbol>
       <symbol id="i-activity" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
       <symbol id="i-log" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></symbol>
@@ -55,12 +56,12 @@
   <header class="topbar">
     <div class="brand"><img src="icon.svg" alt="" width="28" height="28"><span>Updaterr</span></div>
     <nav class="tabs" id="tabs" aria-label="Sekce" data-i18n-aria-label="nav.sections">
-      <button data-tab="proposals" aria-current="page"><svg class="ic"><use href="#i-inbox"/></svg><span data-i18n="nav.proposals">Návrhy</span><b class="count" id="count-proposals" hidden></b></button>
-      <button data-tab="library"><svg class="ic"><use href="#i-library"/></svg><span data-i18n="nav.library">Knihovna</span></button>
-      <button data-tab="activity"><svg class="ic"><use href="#i-activity"/></svg><span data-i18n="nav.activity">Aktivita</span><b class="count" id="count-activity" hidden></b></button>
-      <button data-tab="backups"><svg class="ic"><use href="#i-archive"/></svg><span data-i18n="nav.backups">Zálohy</span></button>
-      <button data-tab="log"><svg class="ic"><use href="#i-log"/></svg><span data-i18n="nav.log">Log</span></button>
-      <button data-tab="settings"><svg class="ic"><use href="#i-settings"/></svg><span data-i18n="nav.settings">Nastavení</span></button>
+      <button data-tab="proposals" data-i18n-title="nav.proposals" data-i18n-aria-label="nav.proposals" aria-current="page"><svg class="ic"><use href="#i-inbox"/></svg><span data-i18n="nav.proposals">Návrhy</span><b class="count" id="count-proposals" hidden></b></button>
+      <button data-tab="library" data-i18n-title="nav.library" data-i18n-aria-label="nav.library"><svg class="ic"><use href="#i-library"/></svg><span data-i18n="nav.library">Knihovna</span></button>
+      <button data-tab="activity" data-i18n-title="nav.activity" data-i18n-aria-label="nav.activity"><svg class="ic"><use href="#i-activity"/></svg><span data-i18n="nav.activity">Aktivita</span><b class="count" id="count-activity" hidden></b></button>
+      <button data-tab="backups" data-i18n-title="nav.backups" data-i18n-aria-label="nav.backups"><svg class="ic"><use href="#i-archive"/></svg><span data-i18n="nav.backups">Zálohy</span></button>
+      <button data-tab="log" data-i18n-title="nav.log" data-i18n-aria-label="nav.log"><svg class="ic"><use href="#i-log"/></svg><span data-i18n="nav.log">Log</span></button>
+      <button data-tab="settings" data-i18n-title="nav.settings" data-i18n-aria-label="nav.settings"><svg class="ic"><use href="#i-settings"/></svg><span data-i18n="nav.settings">Nastavení</span></button>
     </nav>
     <div class="topbar-end">
       <div class="pulse" id="pulse" role="status" aria-live="polite"></div>
@@ -100,6 +101,19 @@
   </dialog>
 
   <div class="toasts" id="toasts" aria-live="polite"></div>
+  <!-- Hromadná kontrola (Knihovna) -->
+  <dialog class="modal modal-wide" id="bulk" aria-labelledby="bulk-title">
+    <form method="dialog">
+      <h2 id="bulk-title" data-i18n="bulk.title">Hromadná kontrola</h2>
+      <div id="bulk-body"></div>
+      <div class="modal-actions">
+        <button value="cancel" class="btn ghost" data-i18n="common.back">Zpět</button>
+        <button value="ok" class="btn primary" id="bulk-ok" data-i18n="bulk.start">Spustit</button>
+      </div>
+    </form>
+  </dialog>
+
   <script src="i18n.js"></script>
+  <script src="lib.js"></script>
 </body>
 </html>

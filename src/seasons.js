@@ -5,6 +5,7 @@ const { t } = require('./i18n');
 const MAX_SEASON = 99;
 const DASH = '[-–—~]';
 const SEP = '[\\s._]';
+const WORD_START = '(?<![\\p{L}\\d])'; // \b z ASCII – před "ř"/"Ř" nefunguje
 
 const range = (a, b) => {
   a = Number(a);
@@ -32,8 +33,9 @@ function parseSeasons(text) {
     add(nums.length === 2 ? range(nums[0], nums[1]) : nums);
   }
 
-  // Season 1-4, Seasons 1 to 4, Série 1-3, Season.1.4
-  const reWordRange = new RegExp(`\\b(?:seasons?|series|s[eé]rie|serie|řada|rada|sezóna|sezona)${SEP}*(\\d{1,2})${SEP}*(?:${DASH}|to|až|az)?${SEP}*(\\d{1,2})\\b(?!\\s*(?:p|i|bit)\\b)`, 'gi');
+  // Season 1-4, Seasons 1 to 4, Série 1-3, Season.1.4. Čísla musí být celá ("Season 14" není 1–4)
+  // a druhé nesmí být kanály zvuku ("Season 1 5.1"). \b nefunguje před "ř" – proto lookbehind s /u.
+  const reWordRange = new RegExp(`${WORD_START}(?:seasons?|series|s[eé]rie|serie|řada|rada|sezóna|sezona)${SEP}*(\\d{1,2})(?!\\d)${SEP}*(?:${DASH}|to|až|az)?${SEP}*(\\d{1,2})\\b(?![.,]\\d)(?!\\s*(?:p|i|bit)\\b)(?!${SEP}*(?:ep|eps|episodes?|epizod[aey]?|d[ií]l[yůu]?)\\b)`, 'giu');
   while ((m = reWordRange.exec(t))) add(range(m[1], m[2]));
 
   // 1-4. série, 1.-3. řada, 1. - 4. sezóna
@@ -43,7 +45,7 @@ function parseSeasons(text) {
   // Jednotlivě: S01, S01E05, Season 2, 2. série
   const reSingle = /\bS(\d{1,2})(?=E\d|\b)/gi;
   while ((m = reSingle.exec(t))) add([Number(m[1])]);
-  const reWord = /\b(?:season|s[eé]rie|serie|řada|rada|sezóna|sezona)[\s._]*(\d{1,2})\b(?!\s*(?:p|i|bit)\b)/gi;
+  const reWord = /(?<![\p{L}\d])(?:season|series|s[eé]rie|serie|řada|rada|sezóna|sezona)[\s._]*(\d{1,2})\b(?!\s*(?:p|i|bit)\b)/giu;
   while ((m = reWord.exec(t))) add([Number(m[1])]);
   const reCz = /\b(\d{1,2})\.\s*(?:s[eé]rie|řada|rada|sezóna|sezona)\b/gi;
   while ((m = reCz.exec(t))) add([Number(m[1])]);

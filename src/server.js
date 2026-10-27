@@ -4,7 +4,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { ArrClient } = require('./arr');
-const { Store, DEFAULT_SETTINGS } = require('./store');
+const { Store, DEFAULT_SETTINGS, validateSettings } = require('./store');
 const { syncLibrary } = require('./library');
 const { Searcher, itemNeeds, itemLabel, rejectProposal, proposalKeys, candId } = require('./search');
 const { Downloads } = require('./downloads');
@@ -20,6 +20,9 @@ const { TorrentCleanup } = require('./cleanup');
 const { Notifier } = require('./notify');
 const { Inbox } = require('./inbox');
 const { attachJobs } = require('./jobs');
+const { send, publicCand, csrfBlocked } = require('./http');
+const { FirstGrab } = require('./firstgrab');
+const { Jellyseerr } = require('./jellyseerr');
 const W = require('./watch');
 const L = require('./lang');
 const LANGS = require('./languages');
@@ -65,6 +68,8 @@ ctx.langChecker = new LC.LangChecker(ctx);
 ctx.stallGuard = new StallGuard(ctx);
 ctx.torrentCleanup = new TorrentCleanup(ctx);
 ctx.backups = new Backups(ctx);
+ctx.firstGrab = new FirstGrab(ctx);
+ctx.jellyseerr = new Jellyseerr(env);
 
 attachJobs(ctx);
 ctx.versions = {};
@@ -73,12 +78,6 @@ const allJobs = () => [...Object.values(store.s.downloads), ...Object.values(sto
 // --- HTTP ----------------------------------------------------------------------
 
 const MIME = { '.html': 'text/html; charset=utf-8', '.json': 'application/json; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon' };
-
-function send(res, code, data) {
-  const body = typeof data === 'string' ? data : JSON.stringify(data);
-  res.writeHead(code, { 'Content-Type': typeof data === 'string' ? 'text/plain; charset=utf-8' : 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-  res.end(body);
-}
 
 async function readBody(req) {
   const chunks = [];
@@ -122,11 +121,15 @@ function itemView(it) {
     proposalId: proposal?.id || null, downloadId: dl?.id || null, watch: W.watchOf(store, it), want, codec,
     sync: ctx.dubsync.summary(it), syncable: syncable(it), syncQueued: ctx.dubsync.queued(it.key),
     langCheck: it.langCheck ? { ...it.langCheck, fileIds: undefined } : null, langChecking: ctx.langChecker.current === it.key,
+    badDonors: ctx.merger.badDonorsOf(it.key),
   };
 }
 
+// Chybějící položky (první stažení, firstgrab.js) nemají soubor – do Knihovny ani statistik nepatří
+const libraryItems = () => Object.values(store.s.items).filter((i) => !i.missing);
+
 function overview() {
-  const items = Object.values(store.s.items);
+  const items = libraryItems();
   const tiers = [0, 0, 0, 0];
   items.forEach((i) => tiers[i.current.tier]++);
   return {
@@ -146,7 +149,10 @@ function overview() {
     pending: Object.values(store.s.proposals).filter((p) => p.status === 'pending').length,
     downloading: ctx.downloads.active().length + ctx.merger.active().length + ctx.dubsync.active().length,
     syncCheck: ctx.dubsync.status(),
+    langQueue: ctx.langChecker.status(),
     stalls: ctx.stallGuard.summary(),
+    firstGrab: ctx.firstGrab.summary(),
+    jellyseerr: ctx.jellyseerr.summary(),
     queue: ctx.searcher.eligible().length,
     searchingNow: ctx.searcher.current ? itemLabel(store.s.items[ctx.searcher.current] || { title: ctx.searcher.current }) : null,
     manualQueue: ctx.searcher.manual.length,
@@ -169,7 +175,7 @@ function otherSeasons(p) {
   const it = store.s.items[p.itemKey];
   if (it?.app !== 'sonarr') return [];
   const keys = new Set(proposalKeys(p));
-  const all = Object.values(store.s.items).filter((x) => x.app === 'sonarr' && x.arrId === it.arrId);
+  const all = libraryItems().filter((x) => x.app === 'sonarr' && x.arrId === it.arrId);
   const have = new Set(all.map((x) => x.season));
   // série bez souborů mezi staženými (položky vznikají jen ze souborů) – ať v přehledu není díra
   const missing = Array.from({ length: Math.max(...have) }, (_, i) => i + 1).filter((n) => !have.has(n))
@@ -182,17 +188,20 @@ const routes = [];
 const route = (method, pattern, fn) => routes.push({ method, re: new RegExp('^' + pattern.replace(/:(\w+)/g, '(?<$1>[^/]+)') + '$'), fn });
 
 route('GET', '/api/overview', () => overview());
-route('GET', '/api/items', () => Object.values(store.s.items).map(itemView));
+route('GET', '/api/items', () => libraryItems().map(itemView));
+// Návrhy prvního stažení se schvalují samy – ukazuje se jen stahování v Aktivitě
 route('GET', '/api/proposals', () => Object.values(store.s.proposals)
-  .filter((p) => p.status === 'pending' || Date.now() - Date.parse(p.updatedAt) < 14 * 86400e3)
+  .filter((p) => !p.first && (p.status === 'pending' || Date.now() - Date.parse(p.updatedAt) < 14 * 86400e3))
   .map((p) => ({
     ...p,
-    candidates: (p.candidates || []).map((c) => ({ ...c, cid: candId(c), arr: undefined, arrRejections: undefined })),
+    candidates: (p.candidates || []).map((c) => ({ ...publicCand(c), cid: candId(c) })),
     item: store.s.items[p.itemKey] ? itemView(store.s.items[p.itemKey]) : null,
     otherSeasons: otherSeasons(p),
+    approving: ctx.inflight.get(p.id) || null, // guid kandidáta, který se právě schvaluje
   }))
   .sort((a, b) => (a.status === 'pending' ? 0 : 1) - (b.status === 'pending' ? 0 : 1) || String(b.updatedAt).localeCompare(String(a.updatedAt))));
-route('GET', '/api/downloads', () => allJobs().sort((a, b) => (b.active - a.active) || b.grabbedAt - a.grabbedAt).slice(0, 200));
+route('GET', '/api/downloads', () => allJobs().sort((a, b) => (b.active - a.active) || b.grabbedAt - a.grabbedAt).slice(0, 200)
+  .map((j) => ({ ...j, candidate: publicCand(j.candidate), offerPending: store.s.proposals[j.offerProposalId]?.status === 'pending' })));
 route('GET', '/api/log', () => store.s.log.slice(-400).reverse());
 route('GET', '/api/settings', () => ({ settings: store.settings, defaults: DEFAULT_SETTINGS }));
 // Jazyky, které jde vybrat (názvy si UI přeloží samo přes Intl.DisplayNames), a jazyky textů UI
@@ -211,16 +220,10 @@ route('PUT', '/api/settings', async (req) => {
   if (pri && !LANGS.get(pri)) throw new Error(I18N.t('settings.err.unknownLanguage', { code: pri }));
   if (sec && !LANGS.get(sec)) throw new Error(I18N.t('settings.err.unknownLanguage', { code: sec }));
   if (pri && pri === sec) throw new Error(I18N.t('settings.err.sameLanguages'));
-  for (const [k, def] of Object.entries(DEFAULT_SETTINGS)) {
-    if (!(k in body)) continue;
-    const v = body[k];
-    if (k === 'uiLanguage' && v !== 'auto' && !I18N.LOCALES.includes(v)) continue;
-    if (typeof def === 'number') { const n = Number(v); if (Number.isFinite(n) && n >= 0) store.settings[k] = n; }
-    else if (typeof def === 'boolean') store.settings[k] = Boolean(v);
-    else if (k === 'speechModel' && !['base', 'small'].includes(v)) continue;
-    else if (k === 'autoWatchNew' && !['off', 'auto', 'ask'].includes(v)) continue;
-    else store.settings[k] = String(v);
-  }
+  const firstGrabWas = [store.settings.firstGrab, store.settings.firstGrabMovies, store.settings.firstGrabSeries].join();
+  const { values, errors } = validateSettings(body, store.settings, { uiLanguage: ['auto', ...I18N.LOCALES] });
+  if (errors.length) throw Object.assign(new Error(I18N.t('settings.err.invalid', { errors: errors.join('; ') })), { status: 400 });
+  Object.assign(store.settings, values);
   applyLanguages();
   const langsChanged = [store.settings.language, store.settings.secondLanguage].join() !== langsBefore;
   if (langsChanged) resetForLanguages();
@@ -228,6 +231,10 @@ route('PUT', '/api/settings', async (req) => {
   store.log('info', I18N.t('server.settingsSaved'));
   // Nová retence záloh platí hned, i pro stávající zálohy
   if (retentionKeys() !== backupRetention) ctx.backups.tick();
+  // Zapnuté první stažení: hned si zapamatovat, co teď chybí (to se Updaterru netýká)
+  if (!READ_ONLY && [store.settings.firstGrab, store.settings.firstGrabMovies, store.settings.firstGrabSeries].join() !== firstGrabWas) {
+    if (store.settings.firstGrab) ctx.firstGrab.poke(0); else ctx.firstGrab.poll().catch(() => {});
+  }
   return { settings: store.settings };
 });
 
@@ -259,6 +266,9 @@ route('POST', '/api/items/:key/ignore', async (req, { params }) => {
   const it = store.s.items[params.key];
   if (!it) throw Object.assign(new Error(I18N.t('err.itemNotFound')), { status: 404 });
   const { days = 3650 } = await readBody(req);
+  if (Object.values(store.s.proposals).some((p) => ctx.inflight.has(p.id) && proposalKeys(p).includes(it.key))) {
+    throw new Error(I18N.t('server.err.approvingItem'));
+  }
   it.ignoredUntil = Number(days) > 0 ? new Date(Date.now() + Number(days) * 86400e3).toISOString() : null;
   for (const p of Object.values(store.s.proposals)) if (p.itemKey === it.key && !p.groupKey && p.status === 'pending') p.status = 'rejected';
   store.save();
@@ -369,6 +379,26 @@ route('POST', '/api/items/:key/verify-language', async (req, { params }) => {
   }
 });
 
+// Hromadný poslech: ověřit jazyk stop u všech (neověřených) položek – postupně na pozadí, hledání má přednost
+route('POST', '/api/verify-all', async (req) => {
+  const { app, force = false } = await readBody(req);
+  if (!speech.available()) throw new Error(I18N.t('server.err.noSpeech'));
+  const scope = libraryItems().filter((it) => !app || it.app === app);
+  // neověřené, a znovu i ty, u kterých poslech dřív selhal (force = poslechnout i ověřené)
+  const failed = (it) => !LC.unverified(it) && it.langCheck?.error;
+  const n = ctx.langChecker.enqueueAll(scope.filter((it) => !force && LC.unverified(it)).map((it) => it.key))
+    + ctx.langChecker.enqueueAll(scope.filter((it) => force || failed(it)).map((it) => it.key), { force: true });
+  store.log('info', I18N.t(force ? 'server.verifyAllForce' : 'server.verifyAll', { count: n }));
+  ctx.langChecker.tick().catch((e) => store.log('error', e.message));
+  return { queued: n, ...ctx.langChecker.status() };
+});
+
+route('DELETE', '/api/verify-all', () => {
+  const left = ctx.langChecker.cancel();
+  if (left) store.log('info', I18N.t('server.verifyAllCancelled', { count: left }));
+  return { cancelled: left };
+});
+
 route('POST', '/api/check-all', async (req) => {
   const { maxTier = 2, app } = await readBody(req);
   let n = 0;
@@ -393,6 +423,7 @@ route('POST', '/api/proposals/:id/reject', async (req, { params }) => {
   if (!p) throw Object.assign(new Error(I18N.t('err.proposalNotFound')), { status: 404 });
   const { days = 3650, guid } = await readBody(req);
   if (p.status === 'grabbed') throw new Error(I18N.t('err.proposalDownloading'));
+  if (ctx.inflight.has(p.id)) throw new Error(I18N.t('server.err.approving'));
   if (guid) {
     // jen jeden kandidát
     store.s.ignoredGuids[guid] = Date.now();
@@ -405,6 +436,10 @@ route('POST', '/api/proposals/:id/reject', async (req, { params }) => {
   store.save();
   return p;
 });
+
+// Nevhodný donor (sloučení s ním neprošlo) zase povolit
+route('DELETE', '/api/bad-donors/:id', (req, { params }) => { ctx.merger.forgetBadDonor(params.id); return { ok: true }; });
+route('POST', '/api/bad-donors/:id/retry', (req, { params }) => { ctx.merger.forgetBadDonor(params.id, { retry: true }); return { ok: true }; });
 
 route('POST', '/api/downloads/:id/cancel', async (req, { params }) => {
   if (store.s.syncFixes[params.id]) await ctx.dubsync.cancel(params.id);
@@ -503,6 +538,11 @@ route('POST', '/api/webhook/:app', async (req, { params, query }) => {
   const body = await readBody(req);
   const ev = body.eventType;
   if (ev === 'Test') return { ok: true };
+  // Nový film / seriál, nebo Radarr/Sonarr něco stáhl → první stažení (firstgrab.js) to projde hned
+  if (['MovieAdded', 'SeriesAdd', 'Grab'].includes(ev)) {
+    if (!READ_ONLY) ctx.firstGrab.poke();
+    return { ok: true };
+  }
   if (ev !== 'Download') return { ignored: ev };
   if (params.app === 'radarr' && Number.isInteger(body.movie?.id)) webhookKeys.add(`radarr:${body.movie.id}`);
   if (params.app === 'sonarr' && Number.isInteger(body.series?.id) && Array.isArray(body.episodes)) {
@@ -527,6 +567,7 @@ async function handle(req, res) {
   }
 
   if (url.pathname.startsWith('/api/')) {
+    if (csrfBlocked(req, url.pathname)) return send(res, 403, { error: I18N.t('server.err.crossSite') });
     if (READ_ONLY && req.method !== 'GET' && !READ_ONLY_ALLOWED.some((re) => re.test(url.pathname))) {
       return send(res, 403, { error: I18N.t('readOnly.blocked') });
     }
@@ -600,7 +641,10 @@ async function main() {
   if (store.settings.useGpu && speech.available()) checkGpu(I18N.t('server.reason.start')).catch((e) => store.log('warn', I18N.t('server.gpuCheckFailed', { error: e.message })));
 
   await syncLibrary(ctx);
-  setInterval(() => syncLibrary(ctx).catch((e) => store.log('error', e.message)), Math.max(5, store.settings.librarySyncMin) * 60e3);
+  // setTimeout místo setInterval: změna intervalu v Nastavení platí hned od dalšího kola
+  const librarySync = () => setTimeout(() => syncLibrary(ctx).catch((e) => store.log('error', e.message)).finally(librarySync),
+    Math.max(5, store.settings.librarySyncMin) * 60e3);
+  librarySync();
   setInterval(() => ctx.searcher.tick().catch((e) => store.log('error', e.message)), 5_000);
   setInterval(() => ctx.downloads.tick().catch((e) => store.log('error', e.message)), 60_000);
   setInterval(() => ctx.merger.tick().catch((e) => store.log('error', e.message)), 30_000);
@@ -612,16 +656,15 @@ async function main() {
   setInterval(backupsTick, 10 * 60e3);
   setInterval(() => ctx.stallGuard.tick().catch((e) => store.log('error', I18N.t('server.stallError', { error: e.message }))), 60_000);
   setInterval(() => ctx.torrentCleanup.tick().catch((e) => store.log('error', I18N.t('server.cleanupError', { error: e.message }))), 2 * 60e3);
-  // Vyřízené návrhy a staré záznamy po 60 dnech pryč
-  setInterval(() => {
-    const cutoff = Date.now() - 60 * 86400e3;
-    for (const [id, p] of Object.entries(store.s.proposals)) if (p.status !== 'pending' && Date.parse(p.updatedAt) < cutoff) delete store.s.proposals[id];
-    for (const [id, d] of Object.entries(store.s.downloads)) if (!d.active && (d.finishedAt || d.grabbedAt) < cutoff) delete store.s.downloads[id];
-    for (const coll of [store.s.merges, store.s.syncFixes]) {
-      for (const [id, j] of Object.entries(coll)) if (!j.active && (j.backupRemoved || !j.backupDir) && (j.finishedAt || j.grabbedAt) < cutoff) delete coll[id];
-    }
-    store.save();
-  }, 6 * 3600e3);
+  // První stažení nově přidaných: co nově chybí, každou minutu (webhook přidání to urychlí)
+  const firstGrabError = (e) => store.log('error', I18N.t('server.firstGrabError', { error: e.message }));
+  setInterval(() => ctx.firstGrab.poll().catch(firstGrabError), 60_000);
+  setInterval(() => ctx.firstGrab.tick().catch(firstGrabError), 5_000);
+  ctx.firstGrab.poll().catch(firstGrabError);
+  // Úklid stavu: vyřízené návrhy a staré záznamy, zablokované releasy (store.prune) – hned a pak každých 6 h
+  const prune = () => { try { store.prune(); } catch (e) { store.log('error', I18N.t('server.pruneError', { error: e.message })); } };
+  prune();
+  setInterval(prune, 6 * 3600e3);
   ctx.notify.pollTelegram();
 }
 

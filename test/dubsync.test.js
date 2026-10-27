@@ -308,6 +308,59 @@ test('oprava – když výsledek nesedí, nic se neimportuje a knihovna zůstane
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test('oprava – výsledek se ověřuje v místech, kde měření před opravou vyšlo spolehlivě', async () => {
+  const { dir, file, ctx, item } = setup();
+  item.syncCheck = { files: { 899: { at: new Date().toISOString(), ok: true, offsetMs: 154, matched: '6/8' } } };
+  const sync = new DubSync(ctx);
+  let verifyOpts = null;
+  const before = [anchor(589, 171, 5.2), anchor(1472, 168, 8.1), anchor(2356, 161), anchor(3239, 160, 5.7), anchor(4123, 151), anchor(5006, 150), anchor(5890, 142), anchor(6773, 140)];
+  await withAudioMocks({
+    probe: async (f) => probeOf(f),
+    checkSync: async (ref, donor, opts) => {
+      if (ref.file === file) return { ok: true, offsetMs: 152, matched: '6/8', anchors: before };
+      verifyOpts = opts;
+      return { ok: true, offsetMs: -2, matched: '5/6' };
+    },
+    run: async (cmd, args) => {
+      if (args[0] === '-J') return JSON.stringify({ tracks: [{ id: 0, type: 'video' }, { id: 1, type: 'audio' }, { id: 2, type: 'audio' }] });
+      fs.writeFileSync(args[1], 'fixed');
+      return '';
+    },
+  }, async () => {
+    const j = sync.start(item.key);
+    await sync.tick();
+    assert.strictEqual(j.state, 'importing', j.message);
+    assert.deepStrictEqual(verifyOpts.times, [1472, 2356, 4123, 5006, 5890, 6773], 'jen místa se z >= 7');
+    assert.strictEqual(verifyOpts.minValid, 4);
+  });
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('oprava – do složky knihovny nejde zapisovat → nic se nevyrábí ani neimportuje', { skip: process.getuid?.() === 0 && 'root může zapisovat všude' }, async () => {
+  const { dir, file, ctx, commands, item } = setup();
+  item.syncCheck = { files: { 899: { at: new Date().toISOString(), ok: true, offsetMs: 220, matched: '8/8' } } };
+  const sync = new DubSync(ctx);
+  let mkvmerge = 0;
+  fs.chmodSync(path.dirname(file), 0o555);
+  try {
+    await withAudioMocks({
+      probe: async (f) => probeOf(f),
+      checkSync: async () => ({ ok: true, offsetMs: 220, matched: '8/8' }),
+      run: async () => { mkvmerge++; return '{}'; },
+    }, async () => {
+      const j = sync.start(item.key);
+      await sync.tick();
+      assert.strictEqual(j.state, 'failed');
+      assert.match(j.message, /nejde zapisovat/);
+      assert.strictEqual(mkvmerge, 0);
+      assert.strictEqual(commands.length, 0);
+    });
+  } finally {
+    fs.chmodSync(path.dirname(file), 0o755);
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('oprava – po přesném změření sedí → nic se nemění', async () => {
   const { dir, file, ctx, commands, item } = setup();
   item.syncCheck = { files: { 899: { at: new Date().toISOString(), ok: true, offsetMs: -95, matched: '5/6' } } };
@@ -418,4 +471,15 @@ test('checkSync – CZ stopa zpožděná o 250 ms ve stejném souboru (ffmpeg)',
   const z = await A.checkSync(T(tr.ref), T(tr.ref), { maxOffsetSec: 10, segmentSec: 20 });
   assert.strictEqual(z.offsetMs, 0);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('streamLang – „SK dabing“ je slovenský, „dabing“ a „Čeština“ český', () => {
+  const lang = (title) => A.streamLang({ tags: { title } }).lang;
+  assert.strictEqual(lang('SK dabing'), 'sk');
+  assert.strictEqual(lang('Slovak dabing DD5.1'), 'sk');
+  assert.strictEqual(lang('CZ dabing'), 'cs');
+  assert.strictEqual(lang('dabing'), 'cs');
+  assert.strictEqual(lang('Čeština DTS'), 'cs');
+  assert.strictEqual(lang('česky'), 'cs');
+  assert.strictEqual(lang('English'), 'en');
 });
