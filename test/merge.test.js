@@ -83,6 +83,24 @@ test('stagingFor – vlastní složka aplikace, jinak společná', () => {
   assert.strictEqual(stagingFor({ ...st, stagingDir: '' }, 'sonarr'), '');
 });
 
+test('Store – STAGING_DIR* z prostředí přebije hodnotu uloženou ve state.json', () => {
+  const { Store } = require('../src/store');
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'updaterr-store-'));
+  fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify({ settings: { stagingDir: '/old', stagingDirRadarr: '', stagingDirSonarr: '/tv/saved' } }));
+  const keep = { ...process.env };
+  try {
+    Object.assign(process.env, { STAGING_DIR: '/shared', STAGING_DIR_RADARR: '/movies/staging' });
+    delete process.env.STAGING_DIR_SONARR;
+    const st = new Store(dir).settings;
+    assert.strictEqual(st.stagingDir, '/shared');
+    assert.strictEqual(st.stagingDirRadarr, '/movies/staging');
+    assert.strictEqual(st.stagingDirSonarr, '/tv/saved', 'bez proměnné zůstane uložená hodnota');
+  } finally {
+    for (const k of ['STAGING_DIR', 'STAGING_DIR_RADARR', 'STAGING_DIR_SONARR']) if (k in keep) process.env[k] = keep[k]; else delete process.env[k];
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('mergeCandidates – staging jen pro druhou aplikaci nestačí', () => {
   const item = { app: 'sonarr', season: 1, origLang: 'en', current: { tier: 1, audioSource: 'mediainfo', files: 10 } };
   const r = [{ guid: 'a', title: 'Serial S01 (CZ)[720p]', seeders: 50, protocol: 'torrent', size: 1e9, fullSeason: true, seasonNumber: 1, quality: {}, rejections: [] }];

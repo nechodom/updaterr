@@ -93,6 +93,8 @@ const EMPTY_STATE = () => ({
   log: [],
 });
 
+const ENV_ONLY = { stagingDir: 'STAGING_DIR', stagingDirRadarr: 'STAGING_DIR_RADARR', stagingDirSonarr: 'STAGING_DIR_SONARR' };
+
 class Store {
   constructor(dir) {
     this.dir = dir;
@@ -105,6 +107,8 @@ class Store {
         migrate(loaded);
         this.state = { ...EMPTY_STATE(), ...loaded };
         this.state.settings = { ...DEFAULT_SETTINGS, ...(loaded.settings || {}) };
+        // Pracovní složky se nastavují jen v .env (UI je nemá) – nastavená proměnná má přednost před uloženou hodnotou
+        for (const [k, name] of Object.entries(ENV_ONLY)) if (env[name]) this.state.settings[k] = env[name];
       } catch (e) {
         const bad = this.file + '.broken-' + Date.now();
         fs.renameSync(this.file, bad);
