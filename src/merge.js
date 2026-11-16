@@ -118,11 +118,24 @@ function releaseHash(r) {
   return null;
 }
 
+// Shoda podle názvu neplatí u code 'torrent' (torrent se nestáhl – mrtvý, v qBittorrentu se neobjevil, chyba
+// klienta): vadný je jen ten konkrétní torrent, ne obsah. Stejně pojmenovaný release z jiného trackeru (třeba jen
+// bez diakritiky) může být v pořádku – blokuje se jen podle hashe a GUID.
 function badDonorOf(store, itemKey, r) {
   const hash = releaseHash(r);
   const norm = normTitle(r.title);
   return Object.values(store.s.badDonors || {}).find((b) => (hash && b.hashes.includes(hash)) || b.guids.includes(r.guid) ||
-    (itemKey && b.itemKey === itemKey && norm && b.norm === norm)) || null;
+    (itemKey && b.itemKey === itemKey && norm && b.norm === norm && badDonorCode(b) !== 'torrent')) || null;
+}
+
+// Donory, kvůli kterým se sada epizod pro přidání zvuku nesložila (každá epizoda musí mít donor)
+function badDonorsAmong(store, itemKey, releases) {
+  const out = new Map();
+  for (const r of releases) {
+    const b = badDonorOf(store, itemKey, r);
+    if (b && b.itemKey === itemKey) out.set(b.id, b);
+  }
+  return [...out.values()];
 }
 
 // into = známý záznam: jen k němu přidat další GUID / hash (stejný torrent pod jiným názvem), bez počítání pokusu
@@ -188,11 +201,14 @@ function backfillBadDonors(store) {
 const donorError = (msg, { mismatch = false, code = null, lengthMin = null } = {}) => Object.assign(new Error(msg), { donor: true, mismatch, code, lengthMin });
 const MISMATCH_CODES = new Set(['length', 'fps', 'sync', 'verify']);
 
-// Druh chyby záznamu nevhodného donoru. Starší záznamy (z doby před kódy) mají jen český text důvodu.
+// Druh chyby záznamu nevhodného donoru. Starší záznamy (z doby před kódy) mají jen text důvodu –
+// u nedostupného torrentu i anglický (code 'torrent' přibyl později).
+const TORRENT_FAULT_RE = /se v qBittorrentu neobjevil|Žádný pokrok|qBittorrent hlásí|show(?:ed)? up in qBittorrent|No progress for|qBittorrent reports an error/;
 function badDonorCode(b) {
   if (!b) return null;
   if (b.code) return b.code;
   const r = String(b.reason || '');
+  if (TORRENT_FAULT_RE.test(r)) return 'torrent';
   if (/délka se liší|jiná verze filmu/.test(r)) return 'length';
   if (/jiná snímková frekvence|posun postupně narůstá/.test(r)) return 'fps';
   if (/kontrola výsledku: stopy nesedí/.test(r)) return 'verify';
@@ -387,14 +403,20 @@ class Merger {
   }
 
   // retry = rovnou přehledat položku, ať se „Přidat zvuk“ s tímhle donorem nabídne hned (tlačítko v návrhu)
+  // id může být i víc záznamů oddělených čárkou (donory epizod u sady) – položka se pak přehledá jednou
   forgetBadDonor(id, { retry = false } = {}) {
     const { store } = this.ctx;
-    const b = store.s.badDonors[id];
-    if (!b) throw Object.assign(new Error(I18N.t('merge.err.noRecord')), { status: 404 });
-    delete store.s.badDonors[id];
-    for (const g of b.guids) delete store.s.ignoredGuids[g];
-    if (retry && store.s.items[b.itemKey]) this.ctx.searcher?.enqueue(b.itemKey, { reason: I18N.t('merge.reason.retryAudio') });
-    store.log('info', I18N.t(retry ? 'merge.badDonors.forgotRetry' : 'merge.badDonors.forgot', { label: b.label, title: b.title }));
+    const ids = [...new Set(String(id).split(',').map((x) => x.trim()).filter(Boolean))];
+    const found = ids.map((x) => store.s.badDonors[x]).filter(Boolean);
+    if (!found.length) throw Object.assign(new Error(I18N.t('merge.err.noRecord')), { status: 404 });
+    for (const b of found) {
+      delete store.s.badDonors[b.id];
+      for (const g of b.guids) delete store.s.ignoredGuids[g];
+      store.log('info', I18N.t(retry ? 'merge.badDonors.forgotRetry' : 'merge.badDonors.forgot', { label: b.label, title: b.title }));
+    }
+    if (retry) for (const key of new Set(found.map((b) => b.itemKey))) {
+      if (store.s.items[key]) this.ctx.searcher?.enqueue(key, { reason: I18N.t('merge.reason.retryAudio') });
+    }
     store.save();
   }
 
@@ -697,7 +719,7 @@ class Merger {
     for (const x of j.parts) {
       const t = await this.qbit.byTag(x.tag);
       if (!t) {
-        if (now - j.grabbedAt > 15 * 60e3) return this.fail(j, I18N.t('merge.set.notInQbit', { title: x.title }), { retry: true, part: x });
+        if (now - j.grabbedAt > 15 * 60e3) return this.fail(j, I18N.t('merge.set.notInQbit', { title: x.title }), { retry: true, part: x, memo: { code: 'torrent' } });
         continue;
       }
       x.hash = t.hash;
@@ -719,7 +741,7 @@ class Merger {
         x.filesSelected = true;
         continue; // průběh přečteme příště, až qBittorrent přepočítá vybrané soubory
       }
-      if (/error|missingFiles/i.test(t.state)) return this.fail(j, I18N.t('merge.set.qbitError', { title: x.title, state: t.state }), { retry: true, part: x });
+      if (/error|missingFiles/i.test(t.state)) return this.fail(j, I18N.t('merge.set.qbitError', { title: x.title, state: t.state }), { retry: true, part: x, memo: { code: 'torrent' } });
       if (x === j.parts[0]) await this.stopEarlyFpsCheck(j, t);
       x.progress = Number(t.progress) || 0;
       size += Number(t.size) || 0;
@@ -743,7 +765,7 @@ class Merger {
     }
     if (now - j.lastProgressAt > st.stallHours * 3600e3) {
       const slow = j.parts.filter((x) => x.progress < 1).sort((a, b) => a.progress - b.progress)[0];
-      return this.fail(j, I18N.t('merge.set.stalled', { hours: st.stallHours, title: slow?.title }), { retry: true, part: slow });
+      return this.fail(j, I18N.t('merge.set.stalled', { hours: st.stallHours, title: slow?.title }), { retry: true, part: slow, memo: { code: 'torrent' } });
     }
   }
 
@@ -758,7 +780,7 @@ class Merger {
     const now = Date.now();
     const t = await this.qbit.byTag(`ujob-${j.id}`);
     if (!t) {
-      if (now - j.grabbedAt > 15 * 60e3) return this.fail(j, I18N.t('merge.neverAppeared'), { retry: true });
+      if (now - j.grabbedAt > 15 * 60e3) return this.fail(j, I18N.t('merge.neverAppeared'), { retry: true, memo: { code: 'torrent' } });
       return;
     }
     j.hash = t.hash;
@@ -791,7 +813,7 @@ class Merger {
       j.lastProgressAt = now;
       j.lastLeft = left;
     }
-    if (/error|missingFiles/i.test(t.state)) return this.fail(j, I18N.t('merge.qbitError', { state: t.state }), { retry: true });
+    if (/error|missingFiles/i.test(t.state)) return this.fail(j, I18N.t('merge.qbitError', { state: t.state }), { retry: true, memo: { code: 'torrent' } });
     await this.stopEarlyFpsCheck(j, t);
     if (j.filesSelected && (left === 0 || j.progress >= 1)) {
       j.state = 'ready';
@@ -799,7 +821,7 @@ class Merger {
       return;
     }
     if (now - j.lastProgressAt > st.stallHours * 3600e3) {
-      return this.fail(j, I18N.t('download.noProgress', { hours: st.stallHours }), { retry: true });
+      return this.fail(j, I18N.t('download.noProgress', { hours: st.stallHours }), { retry: true, memo: { code: 'torrent' } });
     }
   }
 
@@ -1256,6 +1278,6 @@ class Merger {
 
 module.exports = {
   Merger, mergeCandidates, neededLang, parseEpisode, backupOriginal, assertReplaceable, isTransient, speechLangs, speedText, retimeNote,
-  releaseHash, badDonorOf, badDonorCode, badDonorLengthMin, failureCode, rememberBadDonor, backfillBadDonors, pruneBadDonorCandidates,
+  releaseHash, badDonorOf, badDonorsAmong, badDonorCode, badDonorLengthMin, failureCode, rememberBadDonor, backfillBadDonors, pruneBadDonorCandidates,
   unblockMismatchedDonors, unblockRetimableDonors, mkvAudioId,
 };

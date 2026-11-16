@@ -765,6 +765,61 @@ test('sada epizod jako donor: každá epizoda bez CZ má vlastní torrent → je
   assert.deepStrictEqual(evaluateMergeSet(h.item, [...releases, rel('e3', 3, 'The Grand Tour S03E03 (2019)(CZ)[1080p]')], ctx, { episodes, files }).parts.map((x) => x.guid), ['e1', 'e2', 'e3']);
 });
 
+test('mrtvý torrent z jiného trackeru neblokuje stejně pojmenovaný release – sada pro přidání zvuku se složí', () => {
+  const { evaluateMergeSet } = require('../src/search');
+  const { rememberBadDonor, badDonorOf, badDonorsAmong, badDonorCode } = require('../src/merge');
+  const { item, episodes, files, rel } = setFixture();
+  const releases = [
+    rel('sk1', 1, 'The Grand Tour S03E01 - Přežijí ti nejtučnější (2019)(CZ)[WEB-DL][1080p]'),
+    rel('sk2', 2, 'The Grand Tour S03E02 - Cesta do Kolumbie (2019)(CZ)[WEB-DL][1080p]'),
+  ];
+  // Jiný tracker: stejný název bez diakritiky a se závorkami jinak – po normalizaci totožný
+  const dead = { id: 'job1', itemKey: item.key, label: 'GT – 03. série', title: 'The Grand Tour S03E01 - Preziji ti nejtucnejsi [2019] [CZ] [WEB-DL] [1080p]',
+    guid: 'https://tracker.example/x', hash: '7375d46ad6b6705ca4aca2161411d8864d0aeff4' };
+  for (const [reason, opts] of [
+    ['cokoli', { code: 'torrent' }],
+    // starší záznamy bez kódu – podle textu (česky i anglicky)
+    [`Žádný pokrok 3 h – torrent „${dead.title}“ je nejspíš mrtvý`, {}],
+    [`Torrent „${dead.title}“ se v qBittorrentu neobjevil`, {}],
+    ['qBittorrent hlásí chybu (error)', {}],
+    [`No progress for 3 h – torrent “${dead.title}” is probably dead`, {}],
+    ["The torrent never showed up in qBittorrent", {}],
+    ['qBittorrent reports an error (error)', {}],
+  ]) {
+    const store = mkStore();
+    const b = rememberBadDonor(store, dead, reason, opts);
+    assert.strictEqual(badDonorCode(b), 'torrent', reason);
+    assert.strictEqual(badDonorOf(store, item.key, releases[0]), null, reason);
+    assert.ok(badDonorOf(store, item.key, { guid: dead.guid, title: 'cokoli' }), 'tentýž torrent (GUID) zůstává blokovaný');
+    assert.ok(badDonorOf(store, item.key, { guid: 'magnet', infoHash: dead.hash, title: 'cokoli' }), 'tentýž torrent (hash) zůstává blokovaný');
+    assert.ok(evaluateMergeSet(item, releases, { store, qbit: { enabled: true } }, { episodes, files }), reason);
+  }
+  // Vada obsahu (synchronizace) platí dál i pro stejný název z jiného trackeru
+  const store = mkStore();
+  rememberBadDonor(store, dead, 'nesedí synchronizace', { code: 'sync' });
+  assert.ok(badDonorOf(store, item.key, releases[0]));
+  assert.strictEqual(evaluateMergeSet(item, releases, { store, qbit: { enabled: true } }, { episodes, files }), null);
+  assert.deepStrictEqual(badDonorsAmong(store, item.key, releases).map((b) => b.title), [dead.title]);
+});
+
+test('odblokování víc donorů najednou (sada) – položka se přehledá jednou', () => {
+  const { Merger, rememberBadDonor } = require('../src/merge');
+  const store = { ...mkStore(), log() {} };
+  // jednorázové migrace v konstruktoru Mergeru už proběhly
+  Object.assign(store.s, { badDonors: {}, merges: {}, proposals: {}, badDonorsBackfilled: true, mismatchUnblocked: true, retimeUnblocked: true });
+  store.s.items['sonarr:3:3'] = { key: 'sonarr:3:3' };
+  const a = rememberBadDonor(store, { id: 'j', itemKey: 'sonarr:3:3', label: 'x', title: 'E01', guid: 'g1' }, 'nesedí synchronizace', { code: 'sync' });
+  const b = rememberBadDonor(store, { id: 'j', itemKey: 'sonarr:3:3', label: 'x', title: 'E02', guid: 'g2' }, 'nesedí synchronizace', { code: 'sync' });
+  store.s.ignoredGuids = { g1: 1, g2: 1, g3: 1 };
+  const queued = [];
+  const m = new Merger({ store, qbit: { enabled: true }, searcher: { enqueue: (k) => queued.push(k) } });
+  m.forgetBadDonor(`${a.id},${b.id}`, { retry: true });
+  assert.deepStrictEqual(store.s.badDonors, {});
+  assert.deepStrictEqual(Object.keys(store.s.ignoredGuids), ['g3']);
+  assert.deepStrictEqual(queued, ['sonarr:3:3']);
+  assert.throws(() => m.forgetBadDonor('neni'), (e) => e.status === 404);
+});
+
 test('sada epizod jako donor: víc torrentů v jedné úloze, epizoda podle torrentu, vadný torrent se zablokuje sám', async () => {
   const os = require('node:os');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'updaterr-mset-'));

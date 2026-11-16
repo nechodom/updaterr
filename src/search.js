@@ -11,7 +11,7 @@ const C = require('./codec');
 const S = require('./seasons');
 const { newId, stagingFor } = require('./store');
 const { fileState, minCodec } = require('./library');
-const { mergeCandidates, badDonorOf, badDonorCode, badDonorLengthMin, neededLang } = require('./merge');
+const { mergeCandidates, badDonorOf, badDonorsAmong, badDonorCode, badDonorLengthMin, neededLang } = require('./merge');
 const W = require('./watch');
 const LC = require('./langcheck');
 const { t } = require('./i18n');
@@ -517,6 +517,19 @@ function withCutMatch(top, combos) {
 // Proč u releasu chybí "Přidat zvuk": sloučení s ním už jednou neprošlo (badDonors) – nabízí se jen výměna
 // celého souboru. Délku hlásí už otherCut jako varování, tady jen ostatní důvody (synchronizace, …).
 // Vrací { note, id } – id záznamu, aby šlo donor rovnou z návrhu odblokovat a zkusit znovu.
+// Sada epizod jen jako výměna souborů, protože část donorů pro přidání zvuku už jednou neprošla – říct proč
+// a dát odkaz na odblokování (badDonorId může být víc id oddělených čárkou)
+function noteBlockedMergeSet(ctx, item, releases, set) {
+  const eps = releases.filter((r) => !r.fullSeason && (r.mappedSeasonNumber ?? r.seasonNumber) === item.season);
+  const bad = badDonorsAmong(ctx.store, item.key, eps);
+  if (!bad.length) return;
+  // starší záznamy mají před důvodem "Nic nešlo sloučit: "
+  const reason = (b) => String(b.reason || t('search.mergeFailed')).replace(/^Nic nešlo sloučit:\s*/, '');
+  const what = bad.slice(0, 3).map((b) => `${(b.title.match(/S\d{1,2}E\d{1,3}/i) || [b.title])[0]}: ${reason(b)}`).join('; ') + (bad.length > 3 ? '; …' : '');
+  set.notes.unshift(t('search.note.mergeSetBlocked', { what }));
+  set.badDonorId = bad.map((b) => b.id).join(',');
+}
+
 function mergeFailedNote(ctx, item, r) {
   if (item.current.truncated) return null;
   const bad = badDonorOf(ctx.store, item.key, r);
@@ -871,6 +884,7 @@ async function searchItem(ctx, item, { reason = t('search.reason.schedule'), sil
       const sf = await seasonFiles(ctx, item);
       const set = wantSet ? evaluateEpisodeSet(item, releases, ctx, sf) : null;
       const mset = wantMergeSet ? evaluateMergeSet(item, releases, ctx, sf) : null;
+      if (set && wantMergeSet && !mset) noteBlockedMergeSet(ctx, item, releases, set);
       top = arrange(set ? [set] : top, mset ? [mset] : []);
     } catch (e) {
       store.log('warn', t('search.episodeSetFailed', { label: itemLabel(item), error: e.message }));

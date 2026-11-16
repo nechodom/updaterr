@@ -565,6 +565,7 @@
   "search.cut.warnOther": "a different cut of the film: now {cur}, {rel} will be downloaded – there's no {lang} dub for the one you have",
   "search.mergeFailed": "the merge failed",
   "search.note.mergeFailed": "audio can't be added, the merge failed: {reason} → only replacing the whole file",
+  "search.note.mergeSetBlocked": "audio can't be added, episode donors already failed ({what}) → only replacing the files",
   "search.mset.dual": "the donors have {p} and {s} → more reliable sync check",
   "search.mset.episodes": "episodes {eps} – each from its own torrent",
   "search.mset.note": "adds {lang} audio to the existing files (the video stays {quality})",

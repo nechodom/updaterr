@@ -594,6 +594,7 @@
   "search.cut.warnOther": "jiná verze filmu: teď {cur}, stáhne se {rel} – k té, co máš, {lang} dabing není",
   "search.mergeFailed": "sloučení selhalo",
   "search.note.mergeFailed": "přidat zvuk nejde, sloučení neprošlo: {reason} → jen výměna celého souboru",
+  "search.note.mergeSetBlocked": "přidat zvuk nejde, donory epizod už jednou neprošly ({what}) → jen výměna souborů",
   "search.mset.dual": "donory mají {p} i {s} → spolehlivější kontrola synchronizace",
   "search.mset.episodes": "epizody {eps} – každá z vlastního torrentu",
   "search.mset.note": "přidá {lang} zvuk do stávajících souborů (video zůstane {quality})",
