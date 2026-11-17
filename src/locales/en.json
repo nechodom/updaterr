@@ -169,7 +169,7 @@
   "merge.result.trackPresent": "the track is already in the file",
   "merge.alreadyContains": "the file already contains a {lang} track (according to the audio tracks) – Radarr/Sonarr just does not list it",
   "merge.nothingMerged": "Nothing could be merged: {why}",
-  "merge.merged": "merged {done}/{total}{failed} – importing",
+  "merge.merged": "merged {done}/{total}{failed} – importing{waiting}",
   "merge.mergedFailed": " (not merged: {list})",
   "merge.hasTrack": "already has the track",
   "merge.relabel.tagged": "track {n} tagged {was} → {lang} by listening",
@@ -538,6 +538,7 @@
   "merge.reason.otherCut": "different cut of the film",
   "merge.reason.retime": "audio tempo retiming",
   "merge.reason.retryAudio": "try adding audio",
+  "merge.reason.missingEpisodes": "missing episodes",
   "merge.replacementNotFound": " · couldn't find a replacement: {error}",
   "merge.retimed": "donor audio retimed to the existing file's tempo ({speed}{pitch})",
   "merge.retimedNoAudio": "the retimed track has no audio",
@@ -546,19 +547,50 @@
   "merge.sameBad": "the same torrent already failed once (“{bad}”: {reason})",
   "merge.set.checking": "{label}: checking that the {count} torrents of the set are still alive…",
   "merge.set.dead": "“{title}” has died in the meantime ({seeders} seeders) – pick another source or search again",
-  "merge.set.downloaded": "donors downloaded – checking the audio tracks and sync",
+  "merge.set.downloaded": "donors downloaded{dropped} – checking the audio tracks and sync",
   "merge.set.gone": "“{title}” is no longer on the indexer – pick another source or search again",
   "merge.set.grabbed": "downloading audio from {count} episode torrents ({indexer}, min. {seeders} seeders) – it will be merged into the existing files{auto}",
   "merge.set.noVideo": "There's no video in the torrent “{title}”",
   "merge.set.notInQbit": "Torrent “{title}” didn't show up in qBittorrent",
-  "merge.set.progress": "{done}/{total} torrents downloaded, min. {seeders} seeders, {speed} MB/s",
+  "merge.set.progress": "{done}/{total} torrents downloaded{dropped}, min. {seeders} seeders, {speed} MB/s",
   "merge.set.qbitError": "qBittorrent reports an error for “{title}” ({state})",
   "merge.set.sameBad": "“{title}”: the same torrent already failed once (“{bad}”: {reason})",
   "merge.set.stalled": "No progress for {hours} h – torrent “{title}” is probably dead",
+  "merge.set.goneTorrent": "Torrent “{title}” disappeared from qBittorrent (something else removed it – e.g. a seeding limit); not the donor's fault",
+  "merge.set.episode": "episode",
+  "merge.set.dropped": "{reason} – {eps} skipped{rest}",
+  "merge.set.droppedRest": {
+    "one": ", {count} more torrent continues",
+    "other": ", {count} more torrents continue"
+  },
+  "merge.set.noneDownloaded": "No torrent of the set downloaded{last}",
+  "merge.set.noneDownloadedLast": " (last: {reason})",
+  "merge.set.stalledNone": "No progress for {hours} h – no torrent of the set downloaded",
+  "merge.set.progressDropped": {
+    "one": " ({count} skipped)",
+    "other": " ({count} skipped)"
+  },
+  "merge.set.downloadedDropped": " ({dropped} of {total} torrents skipped – merging the rest)",
+  "merge.set.batchReady": "{done} of {total} torrents downloaded – merging and importing them now, the rest keep downloading",
+  "merge.set.stillDownloading": {
+    "one": "{count} torrent still downloading",
+    "other": "{count} torrents still downloading"
+  },
+  "merge.set.batchImported": {
+    "one": "imported {count} episode ({eps}), the remaining torrents keep downloading",
+    "other": "imported {count} episodes ({eps}), the remaining torrents keep downloading"
+  },
   "merge.tempo": "tempo {sign}{pct} %",
   "merge.tempoAfter": "after retiming {speed}",
   "merge.tempoKept": "tempo unchanged",
   "merge.warn.otherCut": "{edition} – the length probably won't match",
+  "merge.goneTorrent": "The torrent disappeared from qBittorrent (something else removed it – e.g. a seeding limit); not the donor's fault",
+  "merge.droppedResult": "skipped – {reason}",
+  "merge.mergedWaiting": {
+    "one": " ({count} more torrent still downloading)",
+    "other": " ({count} more torrents still downloading)"
+  },
+  "merge.deletePartFailed": "{label}: deleting torrent “{title}” from qBittorrent failed: {error}",
   "search.cut.note": "video: {cut}, {quality} ({have}) – after import {lang} audio from “{title}” ({gb} GB, {seeders} seeders) is added to it",
   "search.cut.warnByTitle": "the cut is recognized only from the title – whether the dub fits is verified only when adding the audio",
   "search.cut.warnDonorSeeds": "the audio source has few seeders",
@@ -628,5 +660,9 @@
   "firstgrab.handover.already": " – {app} is already downloading itself",
   "firstgrab.handover.search": " – starting a search in {app}",
   "firstgrab.handover.searchFailed": " – the search in {app} can't be started: {error}",
-  "firstgrab.giveUp": "{label}: {why} – {app} keeps watching it itself"
+  "firstgrab.giveUp": "{label}: {why} – {app} keeps watching it itself",
+  "merge.followUp.grabbing": "remaining episodes ({eps}): downloading another donor",
+  "merge.followUp.proposal": "remaining episodes ({eps}): a proposal is waiting in Proposals",
+  "merge.followUp.none": "remaining episodes ({eps}): no suitable donor yet – will retry on the next search",
+  "merge.followUp.failed": "{label}: searching donors for the remaining episodes ({eps}) failed: {error}"
 }

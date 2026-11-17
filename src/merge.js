@@ -101,6 +101,9 @@ function speechLangs(langCheck, fileId, audio) {
   });
 }
 
+// Epizody torrentu sady do logu: „E03, E04“
+const epLabel = (eps) => (eps?.length ? eps.map((e) => `E${String(e).padStart(2, '0')}`).join(', ') : I18N.t('merge.set.episode'));
+
 const isDonorVideo = (f) => VIDEO_EXT.test(f.name) && !/\bsample\b/i.test(f.name);
 
 // --- Nevhodné donory (state.badDonors) ------------------------------------------------------------
@@ -486,7 +489,7 @@ class Merger {
       await this.qbit.ensureCategory(st.qbitCategory, staging);
       await this.qbit.add({
         downloadUrl: cand.downloadUrl, magnetUrl: cand.magnetUrl,
-        savepath: path.join(dir, 'donor'), category: st.qbitCategory, tags: `updaterr,ujob-${id}`,
+        savepath: path.join(dir, 'donor'), category: st.qbitCategory, tags: `updaterr,ujob-${id}`, noShareLimits: true,
       });
     } catch (e) {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -554,7 +557,7 @@ class Merger {
         fs.mkdirSync(x.dir, { recursive: true });
         await this.qbit.add({
           downloadUrl: cand.parts[i].downloadUrl, magnetUrl: cand.parts[i].magnetUrl,
-          savepath: x.dir, category: st.qbitCategory, tags: `updaterr,ujob-${id},${x.tag}`,
+          savepath: x.dir, category: st.qbitCategory, tags: `updaterr,ujob-${id},${x.tag}`, noShareLimits: true,
         }).catch((e) => { throw new Error(`“${x.title}”: ${e.message}`); });
         added.push(x);
       }
@@ -711,62 +714,114 @@ class Merger {
     return part.episodes?.length === 1 ? { s: season, e: part.episodes[0] } : null;
   }
 
-  // Sada torrentů epizod: stav všech torrentů najednou, hotovo až po stažení všech
+  // Sada torrentů epizod: stav všech torrentů najednou. Co se stáhne, hned se sloučí a naimportuje (dávka – process),
+  // ostatní se mezitím stahují dál. Torrent, který se nestáhne (mrtvý, neobjevil se, chyba, bez videa), se vynechá
+  // a pro jeho epizody se pak hledá dál (followUpMissing). Celá úloha selže, jen když se nestáhne vůbec nic.
   async checkSetDownload(j) {
     const st = this.st;
     const now = Date.now();
     let size = 0, left = 0, done = 0, seeds = Infinity, speed = 0;
     for (const x of j.parts) {
+      if (x.state) continue; // vynechaný nebo už zpracovaný v dřívější dávce
       const t = await this.qbit.byTag(x.tag);
       if (!t) {
-        if (now - j.grabbedAt > 15 * 60e3) return this.fail(j, I18N.t('merge.set.notInQbit', { title: x.title }), { retry: true, part: x, memo: { code: 'torrent' } });
+        if (x.hash) await this.dropPart(j, x, I18N.t('merge.set.goneTorrent', { title: x.title }), { blame: false });
+        else if (now - j.grabbedAt > 15 * 60e3) await this.dropPart(j, x, I18N.t('merge.set.notInQbit', { title: x.title }), { code: 'torrent' });
         continue;
       }
       x.hash = t.hash;
       x.savePath = t.save_path;
+      if (!x.shareUnlimited) {
+        await this.qbit.unlimitShare(t.hash).catch(() => {});
+        x.shareUnlimited = true;
+      }
       if (!x.hashChecked) {
         x.hashChecked = true;
         const bad = badDonorOf(this.ctx.store, null, { guid: x.guid, infoHash: t.hash });
         if (bad) {
-          rememberBadDonor(this.ctx.store, this.partJob(j, x), bad.reason, { into: bad });
-          return this.fail(j, I18N.t('merge.set.sameBad', { title: x.title, bad: bad.title, reason: bad.reason }), { retry: true, remember: false, part: x });
+          await this.dropPart(j, x, I18N.t('merge.set.sameBad', { title: x.title, bad: bad.title, reason: bad.reason }), { into: bad });
+          continue;
         }
       }
       if (!x.filesSelected) {
         const files = await this.qbit.files(t.hash);
         if (!files?.length) continue; // metadata magnetu ještě nedorazila
         const wanted = this.wantedFiles(j, files, x);
-        if (!wanted.size) return this.fail(j, I18N.t('merge.set.noVideo', { title: x.title }), { retry: true, part: x });
+        if (!wanted.size) { await this.dropPart(j, x, I18N.t('merge.set.noVideo', { title: x.title })); continue; }
         await this.qbit.setFilePriority(t.hash, files.filter((f) => !wanted.has(f.index)).map((f) => f.index), 0);
         x.filesSelected = true;
         continue; // průběh přečteme příště, až qBittorrent přepočítá vybrané soubory
       }
-      if (/error|missingFiles/i.test(t.state)) return this.fail(j, I18N.t('merge.set.qbitError', { title: x.title, state: t.state }), { retry: true, part: x, memo: { code: 'torrent' } });
+      if (/error|missingFiles/i.test(t.state)) {
+        await this.dropPart(j, x, I18N.t('merge.set.qbitError', { title: x.title, state: t.state }), { code: 'torrent' });
+        continue;
+      }
       if (x === j.parts[0]) await this.stopEarlyFpsCheck(j, t);
       x.progress = Number(t.progress) || 0;
       size += Number(t.size) || 0;
       left += Number(t.amount_left) || 0;
       speed += Number(t.dlspeed) || 0;
       seeds = Math.min(seeds, Number(t.num_seeds) || 0);
-      if (Number(t.amount_left) === 0 || x.progress >= 1) done++;
+      x.complete = Number(t.amount_left) === 0 || x.progress >= 1;
+      if (x.complete) done++;
+    }
+    const live = j.parts.filter((x) => !x.state);
+    const dropped = j.parts.filter((x) => x.state === 'failed' && !x.attempted).length;
+    if (!live.length) {
+      // Nic se už nestahuje: dokončit, co prošlo v dřívějších dávkách, jinak celá úloha selže
+      if (j.parts.some((x) => x.attempted)) return this.endBatch(j, [], []);
+      const last = j.parts.filter((x) => x.reason).at(-1);
+      return this.fail(j, I18N.t('merge.set.noneDownloaded', { last: last ? I18N.t('merge.set.noneDownloadedLast', { reason: last.reason }) : '' }),
+        { retry: true, remember: false });
     }
     j.size = size;
     j.progress = size ? (size - left) / size : 0;
     j.timeleft = speed > 0 ? new Date(left / speed * 1000).toISOString().slice(11, 19) : null;
-    j.message = I18N.t('merge.set.progress', { done, total: j.parts.length, seeders: seeds, speed: (speed / 1024 ** 2).toFixed(1) });
+    j.message = I18N.t('merge.set.progress', {
+      done, total: live.length, seeders: seeds === Infinity ? 0 : seeds, speed: (speed / 1024 ** 2).toFixed(1),
+      dropped: dropped ? I18N.t('merge.set.progressDropped', { count: dropped }) : '',
+    });
     if (j.lastLeft == null || left < j.lastLeft - 5e6) {
       j.lastProgressAt = now;
       j.lastLeft = left;
     }
-    if (done === j.parts.length) {
+    if (done) {
+      // Co se stáhlo, hned sloučit a naimportovat (dávka) – nečekat na ostatní torrenty
       j.state = 'ready';
-      this.log(j, 'info', I18N.t('merge.set.downloaded'));
+      this.log(j, 'info', done === live.length
+        ? I18N.t('merge.set.downloaded', { dropped: dropped ? I18N.t('merge.set.downloadedDropped', { dropped, total: j.parts.length }) : '' })
+        : I18N.t('merge.set.batchReady', { done, total: live.length }));
       return;
     }
     if (now - j.lastProgressAt > st.stallHours * 3600e3) {
-      const slow = j.parts.filter((x) => x.progress < 1).sort((a, b) => a.progress - b.progress)[0];
-      return this.fail(j, I18N.t('merge.set.stalled', { hours: st.stallHours, title: slow?.title }), { retry: true, part: slow, memo: { code: 'torrent' } });
+      // Bez pokroku: nedostažené torrenty jsou mrtvé – vynechat je; co se stáhlo v dřívějších dávkách, zůstává
+      for (const x of live) {
+        await this.dropPart(j, x, I18N.t('merge.set.stalled', { hours: st.stallHours, title: x.title }), { code: 'torrent' });
+      }
+      if (j.parts.some((x) => x.attempted)) return this.endBatch(j, [], []);
+      return this.fail(j, I18N.t('merge.set.stalledNone', { hours: st.stallHours }), { retry: true, remember: false });
     }
+  }
+
+  // Vynechat jeden torrent sady: smazat ho, a když za to může (mrtvý, chyba, bez videa), zablokovat ho jako donor.
+  // blame: false = torrent zmizel bez jeho viny (odebral ho někdo jiný). into = už známý vadný donor (stejný hash).
+  async dropPart(j, x, reason, { blame = true, into = null, code = null } = {}) {
+    const { store } = this.ctx;
+    x.state = 'failed';
+    x.reason = reason;
+    try {
+      const t = await this.qbit.byTag(x.tag);
+      if (t) await this.qbit.delete(t.hash, true);
+    } catch (e) {
+      store.log('warn', I18N.t('merge.deletePartFailed', { label: j.label, title: x.title, error: e.message }));
+    }
+    if (x.dir) fs.rmSync(x.dir, { recursive: true, force: true });
+    if (blame || into) store.s.ignoredGuids[x.guid] = Date.now();
+    if (into) rememberBadDonor(store, this.partJob(j, x), into.reason, { into });
+    else if (blame) rememberBadDonor(store, { ...this.partJob(j, x), finishedAt: Date.now() }, reason, { code });
+    const rest = j.parts.filter((p) => !p.state).length;
+    this.log(j, 'warn', I18N.t('merge.set.dropped', { reason, eps: epLabel(x.episodes), rest: rest ? I18N.t('merge.set.droppedRest', { count: rest }) : '' }));
+    store.save();
   }
 
   // Torrent ze sady jako samostatný "donor" pro paměť nevhodných donorů (badDonors)
@@ -780,11 +835,17 @@ class Merger {
     const now = Date.now();
     const t = await this.qbit.byTag(`ujob-${j.id}`);
     if (!t) {
+      // Torrent tam už byl a zmizel – odebral ho někdo jiný (limit seedování, ručně); donor za to nemůže
+      if (j.hash) return this.fail(j, I18N.t('merge.goneTorrent'));
       if (now - j.grabbedAt > 15 * 60e3) return this.fail(j, I18N.t('merge.neverAppeared'), { retry: true, memo: { code: 'torrent' } });
       return;
     }
     j.hash = t.hash;
     j.savePath = t.save_path;
+    if (!j.shareUnlimited) {
+      await this.qbit.unlimitShare(t.hash).catch(() => {});
+      j.shareUnlimited = true;
+    }
     if (!j.hashChecked) {
       // Hash u části indexerů (1337x) známe až z qBittorrentu – stejný torrent pod jiným názvem / GUID
       j.hashChecked = true;
@@ -833,11 +894,24 @@ class Merger {
     delete j.fpsCheck;
   }
 
+  // Sada epizod se zpracovává po dávkách: hned jak se stáhne některý torrent, jeho epizody se sloučí
+  // a naimportují; ostatní torrenty se mezitím stahují dál (checkImport pak úlohu vrátí do stahování).
   async process(j) {
     const st = this.st;
     j.state = 'processing';
     this.ctx.store.save();
-    const targets = await this.targets(j);
+    const batch = j.parts ? j.parts.filter((x) => !x.state && x.complete) : null;
+    const prior = j.doneResults || [];
+    let targets = await this.targets(j);
+    if (batch) {
+      const earlier = new Set(j.parts.filter((x) => x.attempted).flatMap((x) => x.episodes || []));
+      for (const x of batch) x.attempted = true;
+      const last = !j.parts.some((x) => !x.state && !x.attempted); // po téhle dávce už se nic nestahuje
+      const eps = new Set(batch.flatMap((x) => x.episodes || []));
+      // Epizody z dřívějších dávek přeskočit; epizody bez torrentu (vynechané) ohlásit až v poslední dávce
+      targets = targets.filter((t) => !t.episodeNumbers.some((e) => earlier.has(e)) && (last || t.episodeNumbers.some((e) => eps.has(e))));
+      if (!targets.length) return this.endBatch(j, batch, []);
+    }
     if (!targets.length) {
       await this.cleanup(j, { deleteTorrent: st.mergeDeleteDonor });
       j.active = false;
@@ -847,13 +921,17 @@ class Merger {
       return;
     }
     const donors = [];
-    for (const x of j.parts || [null]) {
+    for (const x of batch || [null]) {
       const files = await this.qbit.files(x ? x.hash : j.hash);
       for (const f of files.filter((f) => f.priority > 0 && isDonorVideo(f))) {
         donors.push(x
           ? { path: path.join(x.savePath, f.name), size: f.size, ep: Merger.partEpisode(x, f.name, j.season), part: x }
           : { path: path.join(j.savePath, f.name), size: f.size, ep: parseEpisode(f.name) });
       }
+    }
+    if (!donors.length && batch) {
+      for (const x of batch) await this.dropPart(j, x, I18N.t('merge.set.noVideo', { title: x.title }));
+      return this.endBatch(j, batch, []);
     }
     if (!donors.length) return this.fail(j, I18N.t('merge.donorNoVideo'), { retry: true });
 
@@ -870,19 +948,26 @@ class Merger {
         ? donors.reduce((a, b) => (b.size > a.size ? b : a))
         : donors.find((d) => d.ep && (d.ep.s == null || d.ep.s === j.season) && t.episodeNumbers.includes(d.ep.e));
       const name = path.basename(t.path);
-      if (!donor) { results.push({ ok: false, target: name, reason: I18N.t('merge.episodeMissing'), donor: true, code: 'episode' }); continue; }
+      if (!donor) {
+        const dropped = j.parts?.find((x) => x.state === 'failed' && x.episodes?.some((e) => t.episodeNumbers.includes(e)));
+        results.push(dropped
+          ? { ok: false, target: name, reason: I18N.t('merge.droppedResult', { reason: dropped.reason }), donor: true, dropped: true, code: 'torrent' }
+          : { ok: false, target: name, reason: I18N.t('merge.episodeMissing'), donor: true, code: 'episode' });
+        continue;
+      }
       const part = donor.part ? j.parts.indexOf(donor.part) : undefined;
       try {
         results.push({ ok: true, part, ...(await this.mergeOne(j, t, donor.path, donor.part)) });
       } catch (e) {
         results.push({ ok: false, part, target: name, reason: e.message, donor: Boolean(e.donor), mismatch: Boolean(e.mismatch), code: e.code || null, lengthMin: e.lengthMin ?? null });
       }
-      j.results = results;
+      j.results = [...prior, ...results];
       j.message = I18N.t('common.processed', { done: results.length, total: targets.length });
       this.ctx.store.save();
     }
-    j.results = results;
+    j.results = [...prior, ...results];
     const ok = results.filter((r) => r.ok && !r.skipped);
+    if (batch && !ok.length) return this.endBatch(j, batch, results);
     if (!ok.length && results.every((r) => r.skipped)) {
       // Stopa v souboru už je (jen ji Radarr/Sonarr neuvádí) – není co dělat, donor nezahazovat jako špatný
       await this.cleanup(j, { deleteTorrent: st.mergeDeleteDonor });
@@ -898,9 +983,7 @@ class Merger {
       // Zablokovat donor a zkusit jiný jen tehdy, když za všechno může donor – ne při místní chybě
       const retry = results.every((r) => r.ok || r.donor);
       const mismatch = results.every((r) => r.ok || r.mismatch);
-      // U sady zablokovat jen torrenty, se kterými to neprošlo (ne celou sadu – zbytek se může hodit do jiné)
-      if (j.parts && retry) this.rememberFailedParts(j, results, { mismatch });
-      return this.fail(j, I18N.t('merge.nothingMerged', { why }), { retry, mismatch, remember: retry && !j.parts, memo: { reason: why, ...failureCode(results) } });
+      return this.fail(j, I18N.t('merge.nothingMerged', { why }), { retry, mismatch, remember: retry, memo: { reason: why, ...failureCode(results) } });
     }
 
     // Záloha původních souborů (hardlink = nezabírá místo navíc; jinak kopie). Bez zálohy se neimportuje.
@@ -926,11 +1009,19 @@ class Merger {
     j.importAt = Date.now();
     j.importedFileIds = ok.map((r) => r.fileId);
     j.backupUntil = Date.now() + Math.max(this.st.keepBackupDays, 30) * 86400e3; // zkrátí se po úspěšném importu
+    if (batch) {
+      j.doneResults = [...prior, ...results];
+      this.markBatch(j, batch, results);
+    }
     this.ctx.store.save();
     try {
       await client.command({ name: 'ManualImport', importMode: 'move', files: files2 });
     } catch (e) {
-      if (e.status && e.status < 500) { j.state = 'processing'; throw e; } // jasné odmítnutí → nic se nestalo
+      if (e.status && e.status < 500) { // jasné odmítnutí → nic se nestalo
+        j.state = 'processing';
+        if (batch) { j.doneResults = prior; for (const x of batch) { delete x.state; delete x.reason; delete x.attempted; } }
+        throw e;
+      }
       j.message = I18N.t('merge.importNoReply', { error: e.message });
     }
     const failed = results.filter((r) => !r.ok);
@@ -938,10 +1029,79 @@ class Merger {
     const donorFailed = failed.filter((r) => r.donor);
     if (donorFailed.length && j.parts) this.rememberFailedParts(j, donorFailed, { mismatch: true });
     else if (donorFailed.length) rememberBadDonor(this.ctx.store, j, partialReason(donorFailed, results.length), failureCode(donorFailed));
+    const waiting = j.parts ? j.parts.filter((x) => !x.state).length : 0;
     this.log(j, 'info', I18N.t('merge.merged', {
       done: ok.length, total: targets.length,
       failed: failed.length ? I18N.t('merge.mergedFailed', { list: failed.map((r) => `${r.target} – ${r.reason}`).join('; ') }) : '',
+      waiting: waiting ? I18N.t('merge.mergedWaiting', { count: waiting }) : '',
     }));
+  }
+
+  // Výsledek dávky sady na jednotlivých torrentech: neprošla žádná jeho epizoda → failed, jinak processed
+  markBatch(j, batch, results) {
+    for (const x of batch) {
+      if (x.state) continue; // vynechaný (dropPart)
+      const mine = results.filter((r) => r.part === j.parts.indexOf(x));
+      if (mine.length && mine.every((r) => !r.ok)) {
+        x.state = 'failed';
+        x.reason = [...new Set(mine.map((r) => r.reason))].join('; ');
+      } else x.state = 'processed';
+    }
+  }
+
+  // Dávka sady skončila bez importu (nic se nesloučilo nebo nebylo co). Stahují se ještě další torrenty → stahovat
+  // dál; jinak dokončit (něco se naimportovalo v dřívější dávce), případně celá úloha selže.
+  async endBatch(j, batch, results) {
+    const st = this.st;
+    j.doneResults = [...(j.doneResults || []), ...results];
+    j.results = j.doneResults;
+    this.markBatch(j, batch, results);
+    const donorFailed = results.filter((r) => !r.ok && r.donor && r.part != null);
+    if (donorFailed.length) this.rememberFailedParts(j, donorFailed);
+    if (st.mergeDeleteDonor) await this.releaseParts(j, batch);
+    if (j.parts.some((x) => !x.state)) return this.resumeDownload(j);
+    const all = j.doneResults;
+    if (all.some((r) => r.ok)) return this.finishBatches(j);
+    if (!all.length) {
+      await this.cleanup(j, { deleteTorrent: st.mergeDeleteDonor });
+      j.active = false;
+      j.state = 'done';
+      j.finishedAt = Date.now();
+      this.log(j, 'info', I18N.t('merge.alreadyHas', { lang: L.label(j.need) }));
+      return;
+    }
+    const failed = all.filter((r) => !r.ok);
+    const why = [...new Set(failed.map((r) => r.reason))].join('; ');
+    return this.fail(j, I18N.t('merge.nothingMerged', { why }),
+      { retry: failed.every((r) => r.donor), mismatch: failed.every((r) => r.mismatch), remember: false });
+  }
+
+  // Zpátky ke stahování zbylých torrentů sady (po dávce)
+  resumeDownload(j) {
+    j.state = 'downloading';
+    j.lastProgressAt = Date.now();
+    j.lastLeft = null;
+    j.message = I18N.t('merge.set.stillDownloading', { count: j.parts.filter((x) => !x.state).length });
+  }
+
+  // Všechny dávky za sebou: dokončit přes checkImport (obnoví položku, uklidí, ohlásí, hledá zbylé epizody)
+  finishBatches(j) {
+    j.state = 'importing';
+    j.importAt = Date.now();
+    j.importedFileIds = [];
+  }
+
+  // Smazat z qBittorrentu torrenty sady, které už jsou zpracované (jejich zvuk je v knihovně)
+  async releaseParts(j, parts) {
+    for (const x of parts) {
+      try {
+        const t = await this.qbit.byTag(x.tag);
+        if (t) await this.qbit.delete(t.hash, true);
+      } catch (e) {
+        this.ctx.store.log('warn', I18N.t('merge.deletePartFailed', { label: j.label, title: x.title, error: e.message }));
+      }
+      if (x.dir) fs.rmSync(x.dir, { recursive: true, force: true });
+    }
   }
 
   async mergeOne(j, t, donorPath, part = null) {
@@ -1143,6 +1303,15 @@ class Merger {
       const item = store.s.items[j.itemKey] || item0;
       item.current = current;
       item.lastSearchedAt = new Date().toISOString();
+      if (j.parts?.some((x) => !x.state)) {
+        // Dávka sady je v knihovně, ostatní torrenty se ještě stahují
+        const batchEps = j.parts.filter((x) => x.state === 'processed' && !x.released);
+        if (this.st.mergeDeleteDonor) await this.releaseParts(j, batchEps);
+        for (const x of batchEps) x.released = true;
+        fs.rmSync(path.join(j.dir, 'out'), { recursive: true, force: true });
+        this.log(j, 'info', I18N.t('merge.set.batchImported', { count: j.importedFileIds.length, eps: epLabel(batchEps.flatMap((x) => x.episodes || [])) }));
+        return this.resumeDownload(j);
+      }
       j.result = { tier: cur.tier, audio: cur.audio, quality: cur.quality };
       if (cur.tier < 3 && j.app === 'radarr') j.warning = I18N.t('merge.warn.afterImport', { app: j.app, audio: cur.audio });
       await this.cleanup(j, { deleteTorrent: this.st.mergeDeleteDonor });
@@ -1157,6 +1326,7 @@ class Merger {
         count: this.st.keepBackupDays, dir: j.backupDir,
       }));
       notify.download(j, 'done').catch(() => {});
+      if (j.parts?.some((x) => x.state === 'failed')) await this.followUpMissing(j);
       return;
     }
     if (now - j.importAt > 20 * 60e3) {
@@ -1171,6 +1341,29 @@ class Merger {
         moved: moved > 0 ? I18N.t('merge.importFailedPartial', { moved, total: j.importedFileIds.length }) : '', outDir, dir: j.backupDir,
       }));
       notify.download(j, 'blocked').catch(() => {});
+    }
+  }
+
+  // Sada se sloučila jen zčásti (část torrentů se nestáhla): hned hledat donory pro epizody, které jazyk pořád
+  // nemají. S retryOnStall se nový donor rovnou stáhne (počítá se jako další pokus), jinak zůstane v Návrzích.
+  async followUpMissing(j) {
+    const item = this.ctx.store.s.items[j.itemKey];
+    if (!item) return;
+    const eps = epLabel(j.parts.filter((x) => x.state === 'failed').flatMap((x) => x.episodes || []));
+    const tryDonor = this.st.retryOnStall && (j.attempt || 1) < this.st.maxRetries;
+    try {
+      const { searchItem } = require('./search');
+      const res = await searchItem(this.ctx, item, { reason: I18N.t('merge.reason.missingEpisodes'), silent: tryDonor });
+      const cands = res.proposal?.candidates || [];
+      const idx = tryDonor ? cands.findIndex((c) => c.kind === 'merge' && c.mergeLang === j.need && !c.otherCut) : -1;
+      if (idx >= 0) {
+        j.followUpId = (await this.start(res.proposal.id, idx, { retryOf: j })).id;
+        this.log(j, 'info', I18N.t('merge.followUp.grabbing', { eps }));
+        return;
+      }
+      this.log(j, 'info', I18N.t(cands.length ? 'merge.followUp.proposal' : 'merge.followUp.none', { eps }));
+    } catch (e) {
+      this.ctx.store.log('warn', I18N.t('merge.followUp.failed', { label: j.label, eps, error: e.message }));
     }
   }
 

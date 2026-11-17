@@ -848,6 +848,7 @@ test('sada epizod jako donor: víc torrentů v jedné úloze, epizoda podle torr
       files: async (h) => Object.values(torrents).find((t) => t.hash === h).files,
       setFilePriority: async (h, ids, prio) => calls.push(['prio', h, ids, prio]),
       prioritizeStart: async () => {},
+      unlimitShare: async (h) => calls.push(['unlimit', h]),
       delete: async (h) => calls.push(['delete', h]),
     };
     const sonarr = { command: async () => ({ id: 1 }) };
@@ -864,13 +865,13 @@ test('sada epizod jako donor: víc torrentů v jedné úloze, epizoda podle torr
     await m.checkDownload(j); // výběr souborů v obou torrentech
     assert.ok(j.parts.every((x) => x.filesSelected));
     assert.deepStrictEqual(calls.filter((c) => c[0] === 'prio').map((c) => c[2]), [[1], [1]], 'nfo vypnuto, video ne');
-    for (const t of Object.values(torrents)) Object.assign(t, { progress: 1, amount_left: 0 });
-    torrents[`ujob-${j.id}-2`].progress = 0.5;
-    torrents[`ujob-${j.id}-2`].amount_left = 5;
+    assert.deepStrictEqual(calls.filter((c) => c[0] === 'unlimit').map((c) => c[1]), ['h1', 'h2'], 'qBittorrent je nesmí po limitu seedování smazat');
+    torrents[`ujob-${j.id}-1`].progress = 0.5;
+    torrents[`ujob-${j.id}-1`].amount_left = 5;
     await m.checkDownload(j);
-    assert.strictEqual(j.state, 'downloading', 'čeká na všechny torrenty');
-    assert.strictEqual(j.progress, 0.75);
-    Object.assign(torrents[`ujob-${j.id}-2`], { progress: 1, amount_left: 0 });
+    assert.strictEqual(j.state, 'downloading');
+    assert.strictEqual(j.progress, 0.25);
+    for (const t of Object.values(torrents)) Object.assign(t, { progress: 1, amount_left: 0 });
     await m.checkDownload(j);
     assert.strictEqual(j.state, 'ready');
 
@@ -903,6 +904,131 @@ test('sada epizod jako donor: víc torrentů v jedné úloze, epizoda podle torr
     assert.strictEqual(store.s.ignoredGuids['mset:abc'], undefined);
     assert.deepStrictEqual(calls.filter((c) => c[0] === 'delete').map((c) => c[1]), ['h1', 'h2']);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('sada epizod: stažené epizody se hned sloučí a naimportují, vadný torrent se vynechá, pro zbytek se hledá dál', async () => {
+  const os = require('node:os');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'updaterr-mset-'));
+  const search = require('../src/search');
+  const origSearch = search.searchItem;
+  try {
+    const store = { ...mkStore({ stagingDir: dir, retryOnStall: true, maxRetries: 3, stallHours: 3, mergeDeleteDonor: true }), log() {}, save() {} };
+    Object.assign(store.s, { merges: {}, proposals: {}, badDonors: {}, badDonorsBackfilled: true, mismatchUnblocked: true, retimeUnblocked: true });
+    const item = { key: 'sonarr:3:1', app: 'sonarr', arrId: 3, season: 1, origLang: 'en', current: { tier: 1, audio: 'eng', quality: 'WEBDL-1080p', fileIds: [201, 202, 203, 204] } };
+    store.s.items[item.key] = item;
+    const part = (n) => ({ guid: `e${n}`, indexerId: 1, title: `The Grand Tour S01E0${n} (CZ)`, size: 5, seeders: 9, episodes: [n], episodeIds: [100 + n], downloadUrl: `http://x/e${n}` });
+    const cand = { kind: 'merge', set: true, guid: 'mset:gt1', title: 'Sada 4 epizod', indexer: 'TreZzoR', seeders: 9, mergeLang: 'cs', parts: [1, 2, 3, 4].map(part) };
+    store.s.proposals.p = { id: 'p', itemKey: item.key, label: 'GT – 01. série', status: 'pending', searchedAt: Date.now(), candidates: [cand] };
+
+    const torrents = {};
+    const calls = [];
+    const qbit = {
+      enabled: true,
+      ensureCategory: async () => {},
+      add: async ({ tags, savepath, noShareLimits }) => {
+        const tag = tags.split(',').at(-1);
+        const n = Number(tag.split('-').at(-1));
+        calls.push(['add', n, noShareLimits]);
+        torrents[tag] = { hash: `h${n}`, save_path: savepath, progress: 0, amount_left: 10, size: 10, num_seeds: 5, dlspeed: 0, state: 'downloading',
+          files: [{ index: 0, name: `The Grand Tour S01E0${n}.mkv`, size: 5, priority: 1 }] };
+      },
+      byTag: async (tag) => torrents[tag] || null,
+      files: async (h) => Object.values(torrents).find((t) => t.hash === h).files,
+      setFilePriority: async () => {},
+      prioritizeStart: async () => {},
+      unlimitShare: async (h) => calls.push(['unlimit', h]),
+      delete: async (h) => { calls.push(['delete', h]); for (const [k, t] of Object.entries(torrents)) if (t.hash === h) delete torrents[k]; },
+      deleteTags: async () => {},
+    };
+    // Sonarr: knihovna série; ManualImport nahradí soubor epizody novým s CZ
+    const file = (id, n, langs) => ({ id, seasonNumber: 1, episodeNumber: n, size: 1e9, quality: { quality: { name: 'WEBDL-1080p', resolution: 1080 } },
+      mediaInfo: { audioLanguages: langs, videoCodec: 'x265' } });
+    const lib = new Map([1, 2, 3, 4].map((n) => [200 + n, file(200 + n, n, 'English')]));
+    const imports = [];
+    const sonarr = {
+      get: async () => [...lib.values()],
+      command: async (c) => {
+        imports.push(c.files.map((f) => f.episodeIds[0] - 100));
+        for (const f of c.files) { const n = f.episodeIds[0] - 100; lib.delete(200 + n); lib.set(300 + n, file(300 + n, n, 'English/Czech')); }
+        return { id: 1 };
+      },
+    };
+    const m = new Merger({ store, qbit, sonarr, busyKeys: () => new Set(), notify: { download: async () => {} } });
+    for (const n of [1, 2, 3, 4]) fs.writeFileSync(path.join(dir, `lib${n}.mkv`), 'x');
+    m.targets = async () => [...lib.values()].filter((f) => f.mediaInfo.audioLanguages === 'English')
+      .map((f) => ({ path: path.join(dir, `lib${f.episodeNumber}.mkv`), episodeNumbers: [f.episodeNumber], episodeIds: [100 + f.episodeNumber], fileId: f.id }));
+    m.mergeOne = async (jj, t) => ({ target: path.basename(t.path), path: t.path, out: t.path + '.out', fileId: t.fileId, episodeIds: t.episodeIds, languages: [], offsetMs: 0 });
+    const tick = async (j) => {
+      if (j.state === 'downloading') await m.checkDownload(j);
+      if (j.state === 'ready') await m.process(j);
+      if (j.state === 'importing') await m.checkImport(j);
+    };
+
+    const j = await m.start('p', 0);
+    assert.deepStrictEqual(calls.filter((c) => c[0] === 'add').map((c) => c[2]), [true, true, true, true], 'donory bez limitu seedování');
+    await tick(j); // výběr souborů
+    assert.deepStrictEqual(calls.filter((c) => c[0] === 'unlimit').map((c) => c[1]), ['h1', 'h2', 'h3', 'h4']);
+
+    // 1) E01 hotová, ostatní se stahují → E01 se hned sloučí a naimportuje, úloha stahuje dál
+    Object.assign(torrents[`ujob-${j.id}-1`], { progress: 1, amount_left: 0 });
+    Object.assign(torrents[`ujob-${j.id}-2`], { progress: 0.4, amount_left: 6 });
+    await tick(j);
+    assert.deepStrictEqual(imports, [[1]], 'jen E01');
+    assert.strictEqual(j.state, 'downloading');
+    assert.strictEqual(j.parts[0].state, 'processed');
+    assert.ok(!torrents[`ujob-${j.id}-1`], 'zpracovaný torrent se smaže hned');
+    assert.ok(j.parts.slice(1).every((x) => !x.state));
+
+    // 2) E03 se stáhla a qBittorrent ji pak sám odebral (dřív než se zpracovala) → vynechá se, bez blokace
+    delete torrents[`ujob-${j.id}-3`];
+    await tick(j);
+    assert.strictEqual(j.parts[2].state, 'failed');
+    assert.match(j.parts[2].reason, /zmizel z qBittorrentu/);
+    assert.strictEqual(store.s.ignoredGuids.e3, undefined);
+    assert.deepStrictEqual(store.s.badDonors, {});
+    assert.strictEqual(j.state, 'downloading');
+
+    // 3) E04 hotová → sloučí se hned
+    Object.assign(torrents[`ujob-${j.id}-4`], { progress: 1, amount_left: 0 });
+    await tick(j);
+    assert.deepStrictEqual(imports, [[1], [4]]);
+    assert.strictEqual(j.state, 'downloading');
+
+    // 4) E02 bez pokroku → vynechá se jako mrtvá (zablokuje se), úloha se dokončí a hledá donor pro E02 a E03
+    const started = [];
+    search.searchItem = async () => ({ proposal: { id: 'p2', candidates: [{ kind: 'language' }, { kind: 'merge', mergeLang: 'cs', set: true }] } });
+    m.start = async (pid, idx, opts) => { started.push([pid, idx, opts.retryOf.id]); return { id: 'next' }; };
+    await tick(j); // po návratu ke stahování se počítá pokrok od teď
+    assert.strictEqual(j.state, 'downloading');
+    j.lastProgressAt = Date.now() - 4 * 3600e3;
+    await tick(j);
+    assert.strictEqual(j.parts[1].state, 'failed');
+    assert.ok(store.s.ignoredGuids.e2);
+    assert.deepStrictEqual(Object.values(store.s.badDonors).map((b) => b.guids), [['e2']]);
+    assert.strictEqual(j.state, 'done');
+    assert.deepStrictEqual(imports, [[1], [4]], 'nic se neimportuje dvakrát');
+    assert.deepStrictEqual(j.results.filter((r) => r.ok).map((r) => r.target), ['lib1.mkv', 'lib4.mkv']);
+    assert.deepStrictEqual(started, [['p2', 1, j.id]], 'pro zbylé epizody se rovnou stahuje další donor');
+    assert.strictEqual(j.followUpId, 'next');
+  } finally {
+    search.searchItem = origSearch;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('sada epizod: když se nestáhne žádný torrent, selže celá úloha', async () => {
+  const store = { ...mkStore({ retryOnStall: false }), log() {} };
+  Object.assign(store.s, { merges: {}, proposals: {}, badDonors: {}, badDonorsBackfilled: true, mismatchUnblocked: true, retimeUnblocked: true });
+  const qbit = { enabled: true, byTag: async () => null, delete: async () => {}, deleteTags: async () => {} };
+  const m = new Merger({ store, qbit, notify: { download: async () => {} } });
+  m.reopen = () => {};
+  const j = { id: 'jx', type: 'merge', itemKey: 'sonarr:9:1', label: 'X', guid: 'mset:x', dir: '/nonexistent/updaterr-jx', state: 'downloading', active: true, attempt: 1,
+    grabbedAt: Date.now() - 3600e3, lastProgressAt: Date.now(), parts: [1, 2].map((n) => ({ guid: `x${n}`, title: `X S01E0${n}`, tag: `ujob-jx-${n}`, episodes: [n], progress: 0 })) };
+  store.s.merges.jx = j;
+  await m.checkDownload(j);
+  assert.strictEqual(j.state, 'failed');
+  assert.match(j.message, /Žádný torrent sady se nestáhl/);
+  assert.ok(j.parts.every((x) => x.state === 'failed'));
 });
 
 test('cleanup smaže z qBittorrentu i ujob tagy (jinak v něm zůstanou po smazaném torrentu)', async () => {

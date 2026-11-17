@@ -975,7 +975,7 @@ function jobDetail(j, tries) {
     : r.ok
     ? `<li class="ok">${icon('check')}<span><b>${esc(r.target)}</b> – ${r.skipped ? t('activity.merge.hasTrack') : `${t('activity.merge.offset', { ms: `${r.offsetMs > 0 ? '+' : ''}${r.offsetMs}` })}, ${t('sync.matched', { n: esc(r.matched || '?') })}${r.via ? ` (${esc(r.via)})` : ''}${r.langNote ? ` · ${esc(r.langNote)}` : ''}`}</span></li>`
     : `<li class="bad">${icon('x')}<span><b>${esc(r.target)}</b> – ${esc(r.reason)}</span></li>`)).join('');
-  const parts = (j.parts || []).length > 1 ? `<ul class="results">${j.parts.map((p) => `<li class="${p.state === 'failed' ? 'bad' : 'ok'}">${icon(p.state === 'failed' ? 'x' : p.state === 'dismissed' || p.progress >= 1 ? 'check' : 'download')}<span class="mono">${esc(p.title)}</span><span class="muted">${Math.round((p.progress || 0) * 100)} %</span></li>`).join('')}</ul>` : '';
+  const parts = (j.parts || []).length > 1 ? `<ul class="results">${j.parts.map((p) => `<li class="${p.state === 'failed' ? 'bad' : 'ok'}">${icon(p.state === 'failed' ? 'x' : p.state === 'dismissed' || p.progress >= 1 ? 'check' : 'download')}<span class="mono">${esc(p.title)}</span><span class="muted">${p.state === 'failed' && p.reason ? t('activity.part.skipped', { reason: esc(p.reason) }) : `${Math.round((p.progress || 0) * 100)} %`}</span></li>`).join('')}</ul>` : '';
   const result = j.result ? tierChip(j.result.tier) : tierChip(c.tier);
   return `<div class="j-detail">
     <div class="o-title">${icon(j.app === 'sonarr' ? 'tv' : 'film')} ${esc(j.title)}</div>

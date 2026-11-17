@@ -952,5 +952,6 @@
   },
   "toast.unblocked": "Odblokováno – při dalším hledání se torrent může znovu nabídnout",
   "trunc.text": "Poškozený soubor – {file} z {runtime} min",
-  "trunc.title": "Soubor je mnohem kratší než film (useknutý nebo poškozený). Zvuk se k němu nepřidává, nabízí se náhrada celým souborem – vždy až po schválení."
+  "trunc.title": "Soubor je mnohem kratší než film (useknutý nebo poškozený). Zvuk se k němu nepřidává, nabízí se náhrada celým souborem – vždy až po schválení.",
+  "activity.part.skipped": "vynecháno – {reason}"
 }

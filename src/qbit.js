@@ -58,12 +58,14 @@ class QbitClient {
    * Přidá torrent. Soubor .torrent stáhneme sami (z Prowlarru přes Radarr/Sonarr odkaz) a nahrajeme,
    * protože qBittorrent by k odkazu nemusel dosáhnout; když odkaz přesměruje na magnet, předáme magnet.
    */
-  async add({ downloadUrl, magnetUrl, savepath, category, tags }) {
+  // noShareLimits: torrent nesmí qBittorrent sám odebrat po dosažení limitu seedování (donor, který čeká na zpracování)
+  async add({ downloadUrl, magnetUrl, savepath, category, tags, noShareLimits = false }) {
     const form = new FormData();
     form.set('savepath', savepath);
     form.set('category', category);
     form.set('tags', tags);
     form.set('autoTMM', 'false');
+    if (noShareLimits) for (const k of ['ratioLimit', 'seedingTimeLimit', 'inactiveSeedingTimeLimit']) form.set(k, '-1');
     let added = false;
     if (downloadUrl) {
       const res = await fetch(downloadUrl, { redirect: 'manual', signal: AbortSignal.timeout(60_000) });
@@ -128,6 +130,13 @@ class QbitClient {
       if (!/HTTP 404/.test(e.message)) throw e;
       return this.req(old, { method: 'POST', form: new URLSearchParams({ hashes }) });
     }
+  }
+
+  // Bez limitu seedování (-1): globální limit s akcí „odebrat torrent (i se soubory)“ by donor smazal dřív, než se
+  // zpracuje – u sady epizod hotové díly čekají na ostatní. Updaterr donor po sloučení smaže sám.
+  unlimitShare(hashes) {
+    return this.req('torrents/setShareLimits', { method: 'POST',
+      form: new URLSearchParams({ hashes, ratioLimit: '-1', seedingTimeLimit: '-1', inactiveSeedingTimeLimit: '-1' }) });
   }
 
   addTags(hashes, tags) { return this.req('torrents/addTags', { method: 'POST', form: new URLSearchParams({ hashes, tags }) }); }

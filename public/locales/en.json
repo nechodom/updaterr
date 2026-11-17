@@ -913,5 +913,6 @@
   },
   "toast.unblocked": "Unblocked – the torrent may be offered again at the next search",
   "trunc.text": "Damaged file – {file} of {runtime} min",
-  "trunc.title": "The file is much shorter than the film (truncated or damaged). No audio is added to it; a whole-file replacement is offered – always only after approval."
+  "trunc.title": "The file is much shorter than the film (truncated or damaged). No audio is added to it; a whole-file replacement is offered – always only after approval.",
+  "activity.part.skipped": "skipped – {reason}"
 }

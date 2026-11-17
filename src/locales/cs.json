@@ -177,7 +177,7 @@
   "merge.result.trackPresent": "stopa už v souboru je",
   "merge.alreadyContains": "soubor {lang} stopu už obsahuje (podle zvukových stop) – Radarr/Sonarr ji jen neuvádí",
   "merge.nothingMerged": "Nic nešlo sloučit: {why}",
-  "merge.merged": "sloučeno {done}/{total}{failed} – importuji",
+  "merge.merged": "sloučeno {done}/{total}{failed} – importuji{waiting}",
   "merge.mergedFailed": " (nesloučeno: {list})",
   "merge.hasTrack": "už má stopu",
   "merge.relabel.tagged": "stopa {n} označená {was} → {lang} podle poslechu",
@@ -567,6 +567,7 @@
   "merge.reason.otherCut": "jiná verze filmu",
   "merge.reason.retime": "přepočet tempa zvuku",
   "merge.reason.retryAudio": "zkusit přidat zvuk",
+  "merge.reason.missingEpisodes": "chybějící epizody",
   "merge.replacementNotFound": " · náhradu se nepodařilo najít: {error}",
   "merge.retimed": "zvuk donoru přepočítán na tempo stávajícího souboru ({speed}{pitch})",
   "merge.retimedNoAudio": "přepočtená stopa nemá zvuk",
@@ -575,19 +576,55 @@
   "merge.sameBad": "stejný torrent už jednou neprošel („{bad}“: {reason})",
   "merge.set.checking": "{label}: ověřuji, že {count} torrentů sady pořád žije…",
   "merge.set.dead": "„{title}“ mezitím umřel ({seeders} seedů) – vyber jiný zdroj nebo hledej znovu",
-  "merge.set.downloaded": "donory staženy – ověřuji zvukové stopy a synchronizaci",
+  "merge.set.downloaded": "donory staženy{dropped} – ověřuji zvukové stopy a synchronizaci",
   "merge.set.gone": "„{title}“ už na indexeru není – vyber jiný zdroj nebo hledej znovu",
   "merge.set.grabbed": "stahuji zvuk z {count} torrentů epizod ({indexer}, min. {seeders} seedů) – sloučí se se stávajícími soubory{auto}",
   "merge.set.noVideo": "V torrentu „{title}“ není žádné video",
   "merge.set.notInQbit": "Torrent „{title}“ se v qBittorrentu neobjevil",
-  "merge.set.progress": "{done}/{total} torrentů staženo, min. {seeders} seedů, {speed} MB/s",
+  "merge.set.progress": "{done}/{total} torrentů staženo{dropped}, min. {seeders} seedů, {speed} MB/s",
   "merge.set.qbitError": "qBittorrent hlásí u „{title}“ chybu ({state})",
   "merge.set.sameBad": "„{title}“: stejný torrent už jednou neprošel („{bad}“: {reason})",
   "merge.set.stalled": "Žádný pokrok {hours} h – torrent „{title}“ je nejspíš mrtvý",
+  "merge.set.goneTorrent": "Torrent „{title}“ zmizel z qBittorrentu (odebral ho někdo jiný – třeba limit seedování), donor za to nemůže",
+  "merge.set.episode": "epizoda",
+  "merge.set.dropped": "{reason} – {eps} vynechána{rest}",
+  "merge.set.droppedRest": {
+    "one": ", {count} další torrent pokračuje",
+    "few": ", {count} další torrenty pokračují",
+    "other": ", {count} dalších torrentů pokračuje"
+  },
+  "merge.set.noneDownloaded": "Žádný torrent sady se nestáhl{last}",
+  "merge.set.noneDownloadedLast": " (naposledy: {reason})",
+  "merge.set.stalledNone": "Žádný pokrok {hours} h – žádný torrent sady se nestáhl",
+  "merge.set.progressDropped": {
+    "one": " ({count} vynechán)",
+    "few": " ({count} vynechány)",
+    "other": " ({count} vynecháno)"
+  },
+  "merge.set.downloadedDropped": " ({dropped} z {total} torrentů vynecháno – sloučí se zbytek)",
+  "merge.set.batchReady": "staženo {done} z {total} torrentů – slučuji a importuji je hned, ostatní se stahují dál",
+  "merge.set.stillDownloading": {
+    "one": "{count} torrent se ještě stahuje",
+    "few": "{count} torrenty se ještě stahují",
+    "other": "{count} torrentů se ještě stahuje"
+  },
+  "merge.set.batchImported": {
+    "one": "naimportována {count} epizoda ({eps}), zbylé torrenty se stahují dál",
+    "few": "naimportovány {count} epizody ({eps}), zbylé torrenty se stahují dál",
+    "other": "naimportováno {count} epizod ({eps}), zbylé torrenty se stahují dál"
+  },
   "merge.tempo": "tempo {sign}{pct} %",
   "merge.tempoAfter": "po přepočtu {speed}",
   "merge.tempoKept": "beze změny tempa",
   "merge.warn.otherCut": "{edition} – délka nejspíš nebude sedět",
+  "merge.goneTorrent": "Torrent zmizel z qBittorrentu (odebral ho někdo jiný – třeba limit seedování), donor za to nemůže",
+  "merge.droppedResult": "vynecháno – {reason}",
+  "merge.mergedWaiting": {
+    "one": " ({count} další torrent se ještě stahuje)",
+    "few": " ({count} další torrenty se ještě stahují)",
+    "other": " ({count} dalších torrentů se ještě stahuje)"
+  },
+  "merge.deletePartFailed": "{label}: smazání torrentu „{title}“ z qBittorrentu selhalo: {error}",
   "search.cut.note": "obraz: {cut}, {quality} ({have}) – po importu se do něj přidá {lang} zvuk z „{title}“ ({gb} GB, {seeders} seedů)",
   "search.cut.warnByTitle": "verze je poznaná jen z názvu – jestli dabing sedí, ověří až přidání zvuku",
   "search.cut.warnDonorSeeds": "zdroj zvuku má málo seedů",
@@ -661,5 +698,9 @@
   "firstgrab.handover.already": " – {app} už stahuje sám",
   "firstgrab.handover.search": " – spouštím hledání v aplikaci {app}",
   "firstgrab.handover.searchFailed": " – hledání v aplikaci {app} nejde spustit: {error}",
-  "firstgrab.giveUp": "{label}: {why} – {app} ho dál hlídá sám"
+  "firstgrab.giveUp": "{label}: {why} – {app} ho dál hlídá sám",
+  "merge.followUp.grabbing": "zbylé epizody ({eps}): stahuji další donor",
+  "merge.followUp.proposal": "zbylé epizody ({eps}): návrh čeká v Návrzích",
+  "merge.followUp.none": "zbylé epizody ({eps}): zatím žádný vhodný donor – zkusí se při dalším hledání",
+  "merge.followUp.failed": "{label}: hledání donorů pro zbylé epizody ({eps}) selhalo: {error}"
 }
